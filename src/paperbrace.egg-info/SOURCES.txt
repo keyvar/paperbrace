@@ -1,0 +1,9 @@
+pyproject.toml
+src/paperbrace/__init__.py
+src/paperbrace/cli.py
+src/paperbrace.egg-info/PKG-INFO
+src/paperbrace.egg-info/SOURCES.txt
+src/paperbrace.egg-info/dependency_links.txt
+src/paperbrace.egg-info/entry_points.txt
+src/paperbrace.egg-info/requires.txt
+src/paperbrace.egg-info/top_level.txt

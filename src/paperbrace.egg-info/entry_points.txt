@@ -1,0 +1,2 @@
+[console_scripts]
+paperbrace = paperbrace.cli:app
