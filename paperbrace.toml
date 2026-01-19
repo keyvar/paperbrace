@@ -1,0 +1,10 @@
+[llm]
+model = "Qwen/Qwen2.5-3B-Instruct"
+max_new_tokens = 350
+temperature = 0.2
+
+[retrieval]
+backend = "chroma"
+persist_dir = "data/chroma"
+collection = "paperbrace_pages"
+embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
