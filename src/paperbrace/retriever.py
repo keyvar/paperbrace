@@ -4,12 +4,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Sequence
 
-import os
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE") # turns off telemetry for Chroma DB
-
-import chromadb
-from chromadb.utils import embedding_functions
-
 
 @dataclass(frozen=True)
 class PageForIndex:
@@ -27,10 +21,11 @@ class RetrievedPage:
     page_num: int
     path: str
     text: str
-    score: float  # lower distance or higher similarity depending on backend
+    score: float  # distance (lower is better for both backends here)
 
 
 class Retriever(Protocol):
+    """Minimal interface your app uses, regardless of vector backend."""
     def upsert_pages(self, pages: Sequence[PageForIndex], **kwargs: Any) -> None: ...
     def delete_paper(self, paper_id: int, **kwargs: Any) -> None: ...
     def query_pages(
@@ -42,68 +37,49 @@ class Retriever(Protocol):
     ) -> List[RetrievedPage]: ...
 
 
-class ChromaPageRetriever:
-    def __init__(
-        self,
-        persist_dir: Path,
-        collection: str,
-        embedding_model: str,
-    ) -> None:
-        self._client = chromadb.PersistentClient(path=str(persist_dir))
-        ef = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=embedding_model
+def make_retriever(
+    *,
+    backend: str,
+    db_path: Optional[Path] = None,
+    persist_dir: Optional[Path] = None,
+    collection: str = "pages",
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+    table: str = "pages_vec",
+) -> Retriever:
+    """
+    Factory that lazily imports the requested backend so missing extras don't break imports.
+
+    Args:
+        backend: "chroma" or "sqlitevec"
+        db_path: SQLite DB path (required for sqlitevec backend)
+        persist_dir: directory for Chroma persistence (required for chroma backend)
+        collection: collection name (chroma)
+        embedding_model: sentence-transformers model id
+        table: vec table name (sqlitevec)
+
+    Returns:
+        A Retriever instance.
+    """
+    b = (backend or "").strip().lower()
+
+    if b == "chroma":
+        if persist_dir is None:
+            raise ValueError("persist_dir is required for backend='chroma'")
+        from paperbrace.chroma_backend import ChromaPageRetriever
+        return ChromaPageRetriever(
+            persist_dir=persist_dir,
+            collection=collection,
+            embedding_model=embedding_model,
         )
-        self._col = self._client.get_or_create_collection(
-            name=collection,
-            embedding_function=ef,
+
+    if b in {"sqlitevec", "sqlite-vec"}:
+        if db_path is None:
+            raise ValueError("db_path is required for backend='sqlitevec'")
+        from paperbrace.sqlitevec_backend import SqliteVecPageRetriever
+        return SqliteVecPageRetriever(
+            db_path=db_path,
+            table=table,
+            embedding_model=embedding_model,
         )
 
-    @staticmethod
-    def _pid(paper_id: int, page_num: int) -> str:
-        return f"{paper_id}:{page_num}"
-
-    def upsert_pages(self, pages: Sequence[PageForIndex], **kwargs: Any) -> None:
-        if not pages:
-            return
-        ids = [self._pid(p.paper_id, p.page_num) for p in pages]
-        docs = [p.text for p in pages]
-        metas = [
-            {"paper_id": p.paper_id, "page_num": p.page_num, "path": p.path}
-            for p in pages
-        ]
-        self._col.upsert(ids=ids, documents=docs, metadatas=metas)
-
-    def delete_paper(self, paper_id: int, **kwargs: Any) -> None:
-        # Deletes all pages for that paper_id (used on re-embed)
-        self._col.delete(where={"paper_id": int(paper_id)})
-
-    def query_pages(
-        self,
-        query: str,
-        k: int,
-        where: Optional[Dict[str, Any]] = None,
-        **kwargs: Any,
-    ) -> List[RetrievedPage]:
-        q_emb = self._st.encode([query], show_progress_bar=False)
-        res = self._col.query(
-            query_texts=[query],
-            n_results=k,
-            where=where,
-            include=["documents", "metadatas", "distances"],
-        )
-        out: List[RetrievedPage] = []
-        docs = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[]])[0]
-
-        for doc, meta, dist in zip(docs, metas, dists):
-            out.append(
-                RetrievedPage(
-                    paper_id=int(meta["paper_id"]),
-                    page_num=int(meta["page_num"]),
-                    path=str(meta["path"]),
-                    text=str(doc),
-                    score=float(dist),
-                )
-            )
-        return out
+    raise ValueError("Unknown retriever backend. Use 'chroma' or 'sqlitevec'.")

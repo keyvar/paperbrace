@@ -1,8 +1,8 @@
-# local-only data (PDFs, datasets, etc.)
-/data/
-/artifacts/
-/runs/
-
-.venv
+.paperbrace/
+data/
+*.db
+*.db-wal
+*.db-shm
 .DS_Store
 __pycache__/
+*.egg-info/

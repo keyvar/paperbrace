@@ -8,17 +8,17 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from paperbrace.db import connect, init_db
-from paperbrace import store
-from paperbrace.render import Evidence, to_markdown
-from paperbrace.llm_client import LLMConfig, generate as llm_generate
 from paperbrace.config import load_config
+from paperbrace.db import connect, init_db
+from paperbrace.llm_client import LLMConfig, generate as llm_generate
+from paperbrace.render import Evidence, to_markdown
+from paperbrace import store
+from paperbrace.paths import DEFAULT_DB, DEFAULT_CHROMA_DIR, DEFAULT_SQLITEVEC_DB
 
 logger = logging.getLogger("paperbrace")
 console = Console()
 
 app = typer.Typer(add_completion=False)
-DEFAULT_DB = "paperbrace.db"
 
 
 def setup_logging(verbose: bool) -> None:
@@ -39,15 +39,14 @@ def _cap_filename(name: str, n: int = 30) -> str:
     """
     Truncate a filename for compact CLI display.
 
-    Keeps the beginning and end of the filename and inserts an ellipsis in the
-    middle (useful for tables).
+    Keeps the beginning and end of the filename and inserts an ellipsis in the middle.
 
     Args:
         name: Filename (no directory).
-        n: Maximum output length (characters).
+        n: Maximum output length.
 
     Returns:
-        A possibly shortened filename with a middle ellipsis.
+        A shortened filename if needed.
     """
     if len(name) <= n:
         return name
@@ -66,10 +65,10 @@ def index(
         dir_okay=True,
         help="Directory to scan for PDFs (recursively).",
     ),
-    db: Path = typer.Option(
-        Path(DEFAULT_DB),
-        "--db",
-        help="SQLite database path.",
+    db_path: Path = typer.Option(
+        DEFAULT_DB,
+        "--db-path",
+        help="SQLite database path (papers/pages/FTS).",
     ),
     commit_every: int = typer.Option(
         200,
@@ -78,22 +77,17 @@ def index(
         max=5000,
         help="Commit frequency while indexing (performance vs safety).",
     ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable debug logging.",
-    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
     Scan PDFs and upsert file metadata into SQLite.
 
-    This command records PDF file metadata (path, mtime, size) in the `papers`
-    table. It does not extract text. Extraction is done via `paperbrace extract`.
+    Records file-level metadata (path, mtime, size) in the `papers` table.
+    Does not extract page text. Use `paperbrace extract` for extraction.
 
     Args:
-        pdf_dir: Folder containing PDFs to index.
-        db: SQLite DB file path.
+        pdf_dir: Folder containing PDFs.
+        db_path: SQLite DB file path.
         commit_every: Commit after every N PDFs processed.
         verbose: Enable debug logging.
 
@@ -101,53 +95,35 @@ def index(
         None
     """
     setup_logging(verbose)
-    conn = connect(db)
+    conn = connect(db_path)
     init_db(conn)
 
     pdf_dir = pdf_dir.expanduser().resolve()
     logger.info("Scanning %s", pdf_dir)
 
     n = store.index_pdfs(conn, pdf_dir=pdf_dir, commit_every=commit_every)
-    logger.info("Indexed %d PDFs → %s", n, db)
+    logger.info("Indexed %d PDFs → %s", n, db_path)
 
 
 @app.command()
 def list(
-    limit: int = typer.Option(
-        20,
-        "--limit",
-        "-n",
-        min=1,
-        max=200,
-        help="Max rows to display.",
-    ),
-    db: Path = typer.Option(
-        Path(DEFAULT_DB),
-        "--db",
-        help="SQLite database path.",
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable debug logging.",
-    ),
+    limit: int = typer.Option(20, "--limit", "-n", min=1, max=200, help="Max rows to display."),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
     List known papers (id + extraction status + path).
 
-    Useful for discovering paper ids (for single-paper extraction/debugging).
-
     Args:
         limit: Maximum number of papers to display.
-        db: SQLite DB file path.
+        db_path: SQLite DB file path.
         verbose: Enable debug logging.
 
     Returns:
         None
     """
     setup_logging(verbose)
-    conn = connect(db)
+    conn = connect(db_path)
     init_db(conn)
 
     rows = store.list_papers(conn, limit=limit)
@@ -165,63 +141,31 @@ def list(
 
 @app.command()
 def extract(
-    paper_id: Optional[int] = typer.Option(
-        None,
-        "--paper-id",
-        min=1,
-        help="Extract a single paper by id.",
-    ),
-    all_: bool = typer.Option(
-        False,
-        "--all",
-        help="Extract all papers in the DB.",
-    ),
-    db: Path = typer.Option(
-        Path(DEFAULT_DB),
-        "--db",
-        help="SQLite database path.",
-    ),
-    force: bool = typer.Option(
-        False,
-        "--force",
-        help="Re-extract even if up-to-date.",
-    ),
-    commit_every: int = typer.Option(
-        5,
-        "--commit-every",
-        min=1,
-        max=200,
-        help="Commit frequency during --all extraction.",
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable debug logging.",
-    ),
+    paper_id: Optional[int] = typer.Option(None, "--paper-id", min=1, help="Extract a single paper by id."),
+    all_: bool = typer.Option(False, "--all", help="Extract all papers in the DB."),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path."),
+    force: bool = typer.Option(False, "--force", help="Re-extract even if up-to-date."),
+    commit_every: int = typer.Option(5, "--commit-every", min=1, max=200, help="Commit frequency during --all."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
     Extract per-page text for one paper or all papers.
 
-    Extraction stores page text in `pages` and builds the keyword index in
-    `pages_fts` for fast searching. Up-to-date PDFs are skipped unless --force.
+    Stores page text in `pages` and updates `pages_fts` for keyword search.
 
     Args:
         paper_id: Extract a single paper by id (mutually exclusive with --all).
         all_: Extract all papers (mutually exclusive with --paper-id).
-        db: SQLite DB file path.
+        db_path: SQLite DB file path.
         force: Re-extract even if PDF mtime is unchanged.
         commit_every: Commit frequency in batch mode.
         verbose: Enable debug logging.
 
     Returns:
         None
-
-    Raises:
-        typer.BadParameter: If both/neither of --paper-id and --all are provided.
     """
     setup_logging(verbose)
-    conn = connect(db)
+    conn = connect(db_path)
     init_db(conn)
 
     if all_ == (paper_id is not None):
@@ -239,70 +183,57 @@ def extract(
 
 @app.command()
 def purge(
-    db: Path = typer.Option(Path(DEFAULT_DB), "--db"),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path."),
     yes: bool = typer.Option(False, "--yes", help="Confirm destructive purge."),
     vacuum: bool = typer.Option(False, "--vacuum", help="Reclaim space after purge (slower)."),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-) -> None:
-    """Delete ALL rows from the DB (papers/pages/pages_fts)."""
-    setup_logging(verbose)
-    if not yes:
-        raise typer.BadParameter("Refusing to purge without --yes")
-
-    conn = connect(db)
-    init_db(conn)
-    store.purge_db(conn, reset_ids=True, vacuum=vacuum)
-    logger.info("Purged DB: %s", db)
-
-
-@app.command()
-def search(
-    query: str = typer.Argument(
-        ...,
-        help="FTS query (supports FTS syntax: AND/OR/NOT, quotes, prefix *).",
-    ),
-    limit: int = typer.Option(
-        10,
-        "--limit",
-        "-n",
-        min=1,
-        max=50,
-        help="Max results to display.",
-    ),
-    db: Path = typer.Option(
-        Path(DEFAULT_DB),
-        "--db",
-        help="SQLite database path.",
-    ),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="Enable debug logging.",
-    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
-    Keyword search over extracted text using SQLite FTS5.
-
-    Displays ranked results with highlighted snippets and filenames. Results are
-    page-level: (paper_id, page_num).
+    Delete ALL rows from the SQLite DB (papers/pages/pages_fts).
 
     Args:
-        query: FTS query string.
-        limit: Maximum number of results to display.
-        db: SQLite DB file path.
+        db_path: SQLite DB file path.
+        yes: Must be set to confirm.
+        vacuum: If True, VACUUM after purge.
         verbose: Enable debug logging.
 
     Returns:
         None
     """
     setup_logging(verbose)
-    conn = connect(db)
+    if not yes:
+        raise typer.BadParameter("Refusing to purge without --yes")
+
+    conn = connect(db_path)
+    init_db(conn)
+    store.purge_db(conn, reset_ids=True, vacuum=vacuum)
+    logger.info("Purged DB: %s", db_path)
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="FTS query (supports AND/OR/NOT, quotes, prefix *)."),
+    limit: int = typer.Option(10, "--limit", "-n", min=1, max=50, help="Max results to display."),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+) -> None:
+    """
+    Keyword search over extracted text using SQLite FTS5.
+
+    Args:
+        query: FTS query string.
+        limit: Max results to show.
+        db_path: SQLite DB file path.
+        verbose: Enable debug logging.
+
+    Returns:
+        None
+    """
+    setup_logging(verbose)
+    conn = connect(db_path)
     init_db(conn)
 
     rows = store.search_pages(conn, query=query, limit=limit)
-    # Expected row shape: (paper_id, page_num, path, snippet, score)
-
     table = Table(title=f"Search: {query!r} (showing {len(rows)})")
     table.add_column("paper_id", justify="right")
     table.add_column("page", justify="right")
@@ -320,28 +251,66 @@ def search(
 def embed(
     paper_id: int = typer.Option(0, "--paper-id", min=0, help="Embed one paper id (0 means use --all)."),
     all_: bool = typer.Option(False, "--all", help="Embed all extracted papers."),
-    db: Path = typer.Option(Path(DEFAULT_DB), "--db"),
-    force: bool = typer.Option(False, "--force"),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path (source pages)."),
+    backend: str = typer.Option(
+        "chroma",
+        "--backend",
+        help="Vector backend: chroma | sqlitevec",
+    ),
+    force: bool = typer.Option(False, "--force", help="Re-embed even if up-to-date."),
     commit_every: int = typer.Option(5, "--commit-every", min=1, max=200),
-    persist_dir: Path = typer.Option(Path("data/chroma"), "--persist-dir"),
-    collection: str = typer.Option("paperbrace_pages", "--collection"),
+    chroma_db_path: Path = typer.Option(DEFAULT_CHROMA_DIR, "--chroma-db-path", help="Chroma persistence directory."),
+    sqlite_vec_db_path: Path = typer.Option(DEFAULT_SQLITEVEC_DB, "--sqlite-vec-db-path", help="sqlite-vec DB path."),
+    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection name (backend-specific)."),
     embedding_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--embedding-model"),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-):
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+) -> None:
     """
-    Build/update the semantic vector index (Chroma) from extracted pages.
+    Build/update the semantic vector index from extracted pages.
+
+    Requires that PDFs are already extracted into `pages` (run `paperbrace extract` first).
+
+    Args:
+        paper_id: Single paper id to embed (0 means use --all).
+        all_: Embed all extracted papers.
+        db_path: SQLite DB file path (papers/pages).
+        backend: Vector backend: chroma or sqlitevec.
+        force: Re-embed even if unchanged.
+        commit_every: Commit frequency for embed bookkeeping.
+        chroma_db_path: Where Chroma persists its index.
+        sqlite_vec_db_path: Separate SQLite DB file for sqlite-vec vectors.
+        collection: Collection name for the backend.
+        embedding_model: Embedding model id for SentenceTransformers.
+        verbose: Enable debug logging.
+
+    Returns:
+        None
     """
     setup_logging(verbose)
-
-    conn = connect(db)
+    conn = connect(db_path)
     init_db(conn)
 
-    from .retriever import ChromaPageRetriever  # local import to keep deps optional
-    retr = ChromaPageRetriever(
-        persist_dir=persist_dir.expanduser().resolve(),
-        collection=collection,
-        embedding_model=embedding_model,
-    )
+    b = (backend or "").strip().lower()
+    if b not in {"chroma", "sqlitevec"}:
+        raise typer.BadParameter("Invalid --backend. Use: chroma | sqlitevec")
+
+    # Lazy imports so optional deps don't load unless selected.
+    if b == "chroma":
+        from paperbrace.chroma_retriever import ChromaPageRetriever  # type: ignore
+
+        retr = ChromaPageRetriever(
+            persist_dir=chroma_db_path.expanduser().resolve(),
+            collection=collection,
+            embedding_model=embedding_model,
+        )
+    else:
+        from paperbrace.sqlitevec_retriever import SqliteVecPageRetriever  # type: ignore
+
+        retr = SqliteVecPageRetriever(
+            db_path=sqlite_vec_db_path.expanduser().resolve(),
+            table=collection,
+            embedding_model=embedding_model,
+        )
 
     if all_ == (paper_id != 0):
         raise typer.BadParameter("Use either --paper-id ID or --all (not both).")
@@ -367,63 +336,48 @@ def ask(
         "--retriever",
         help="Retrieval mode: keyword (FTS5), semantic (embeddings), hybrid (both).",
     ),
-    model: Optional[str] = typer.Option(
-        None, "--model", help="HF model id (overrides config)."
-    ),
-    config: Optional[Path] = typer.Option(
-        None, "--config", help="Path to paperbrace.toml (default: ./paperbrace.toml)."
-    ),
+    model: Optional[str] = typer.Option(None, "--model", help="HF model id (overrides config)."),
+    config: Optional[Path] = typer.Option(None, "--config", help="Path to paperbrace.toml (default: ./paperbrace.toml)."),
     out: Optional[Path] = typer.Option(None, "--out", help="Write answer + evidence to Markdown."),
-    db: Path = typer.Option(Path(DEFAULT_DB), "--db"),
-    # Semantic retriever knobs (used when --retriever semantic|hybrid)
-    persist_dir: Path = typer.Option(Path("data/chroma"), "--persist-dir", help="Chroma persistence directory."),
-    collection: str = typer.Option("paperbrace_pages", "--collection", help="Chroma collection name."),
-    embedding_model: str = typer.Option(
-        "sentence-transformers/all-MiniLM-L6-v2", "--embedding-model", help="SentenceTransformers model for embeddings."
-    ),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path (papers/pages)."),
+    backend: str = typer.Option("chroma", "--backend", help="Vector backend for semantic/hybrid: chroma | sqlitevec"),
+    chroma_db_path: Path = typer.Option(DEFAULT_CHROMA_DIR, "--chroma-db-path", help="Chroma persistence directory."),
+    sqlite_vec_db_path: Path = typer.Option(DEFAULT_SQLITEVEC_DB, "--sqlite-vec-db-path", help="sqlite-vec DB path."),
+    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection/table name for the backend."),
+    embedding_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--embedding-model"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
     Answer a question using retrieved evidence + a local Hugging Face LLM.
 
-    This command is LLM-only: if no model is configured/resolved, it exits with
-    an error message. For pure keyword lookup without an LLM, use `paperbrace search`.
+    This command is LLM-only: if no model is configured/resolved, it exits.
+    For pure keyword lookup without an LLM, use `paperbrace search`.
 
-    Retrieval modes (via --retriever):
+    Retrieval modes:
       - keyword: SQLite FTS5 over extracted pages (pages_fts), ranked by bm25().
-                Natural-language questions are converted to a friendlier OR-based FTS query
-                via `store.nl_to_fts_query`.
-      - semantic: Chroma vector search over embedded pages. Requires running:
-                `paperbrace embed --all ...` beforehand.
-      - hybrid: merge keyword + semantic results, de-duplicating by (paper_id, page_num).
-
-    Model resolution precedence:
-      1) --model overrides everything
-      2) config file [llm].model from paperbrace.toml (via --config or default ./paperbrace.toml)
-      3) if still missing, the command exits (code=2)
+      - semantic: vector search over embedded pages (requires `paperbrace embed`).
+      - hybrid: semantic results first, then keyword fill; de-duped by (paper_id, page_num).
 
     Args:
-        question: Natural-language question to answer.
-        k: Number of evidence pages (top-k) to retrieve and cite.
-        retriever: Retrieval mode ("keyword", "semantic", "hybrid").
-        model: Hugging Face model id to use for local inference (override).
-        config: Optional path to a TOML config file.
-        out: Optional path to write Markdown output (Answer + Evidence).
-        db: SQLite database path.
-        persist_dir: Chroma persistence directory (semantic/hybrid).
-        collection: Chroma collection name (semantic/hybrid).
-        embedding_model: SentenceTransformers embedding model (semantic/hybrid).
+        question: Natural-language question.
+        k: Number of evidence pages.
+        retriever: keyword | semantic | hybrid.
+        model: HF model id (override).
+        config: TOML config file path.
+        out: Optional Markdown output path.
+        db_path: SQLite DB file path.
+        backend: Vector backend for semantic/hybrid.
+        chroma_db_path: Chroma persistence directory.
+        sqlite_vec_db_path: sqlite-vec DB file path.
+        collection: Collection/table name.
+        embedding_model: Embedding model id.
         verbose: Enable debug logging.
 
     Returns:
         None
-
-    Raises:
-        typer.Exit: if no model is configured/resolved.
-        typer.BadParameter: if retriever mode is invalid.
     """
     setup_logging(verbose)
-    conn = connect(db)
+    conn = connect(db_path)
     init_db(conn)
 
     # Resolve model (LLM-only)
@@ -432,7 +386,7 @@ def ask(
     if not resolved_model:
         logger.error(
             "No LLM model configured. Set [llm].model in paperbrace.toml or pass --model. "
-            "For keyword search, use: paperbrace search \"...\""
+            'For keyword search, use: paperbrace search "..."'
         )
         raise typer.Exit(code=2)
 
@@ -440,37 +394,44 @@ def ask(
     if mode not in {"keyword", "semantic", "hybrid"}:
         raise typer.BadParameter("Invalid --retriever. Use: keyword | semantic | hybrid")
 
-    # Retrieve evidence
     rows: list[tuple[int, int, str, str, float]] = []
 
     if mode == "keyword":
         rows = store.get_evidence_pages(conn, query=question, limit=k)
 
     else:
-        # Semantic retrieval (Chroma)
-        from .retriever import ChromaPageRetriever  # keep optional deps lazy
-        chroma = ChromaPageRetriever(
-            persist_dir=persist_dir.expanduser().resolve(),
-            collection=collection,
-            embedding_model=embedding_model,
-        )
+        b = (backend or "").strip().lower()
+        if b not in {"chroma", "sqlitevec"}:
+            raise typer.BadParameter("Invalid --backend. Use: chroma | sqlitevec")
 
-        sem_hits = chroma.query_pages(question, k=k, where=None)
-        sem_rows = [
-            (h.paper_id, h.page_num, h.path, h.text, float(h.score))
-            for h in sem_hits
-        ]
+        # Lazy imports to keep deps optional
+        if b == "chroma":
+            from paperbrace.chroma_retriever import ChromaPageRetriever  # type: ignore
+
+            vec = ChromaPageRetriever(
+                persist_dir=chroma_db_path.expanduser().resolve(),
+                collection=collection,
+                embedding_model=embedding_model,
+            )
+        else:
+            from paperbrace.sqlitevec_retriever import SqliteVecPageRetriever  # type: ignore
+
+            vec = SqliteVecPageRetriever(
+                db_path=sqlite_vec_db_path.expanduser().resolve(),
+                table=collection,
+                embedding_model=embedding_model,
+            )
+
+        sem_hits = vec.query_pages(question, k=k, where=None)
+        sem_rows = [(h.paper_id, h.page_num, h.path, h.text, float(h.score)) for h in sem_hits]
 
         if mode == "semantic":
             rows = sem_rows
-
-        else:  # hybrid
-            # Keyword side: fetch a bit more to help overlap, then merge/dedupe down to k
+        else:
             kw_rows = store.get_evidence_pages(conn, query=question, limit=max(k * 2, k))
             seen: set[tuple[int, int]] = set()
             merged: list[tuple[int, int, str, str, float]] = []
 
-            # Simple merge strategy: semantic first (often higher precision), then keyword fill.
             for pid, pn, path, text, score in sem_rows + kw_rows:
                 key = (int(pid), int(pn))
                 if key in seen:
@@ -482,32 +443,17 @@ def ask(
 
             rows = merged
 
-        if not rows:
-            logger.warning(
-                "No semantic hits. Did you run: paperbrace embed --all --db %s ?", db
-            )
+    items = [Evidence(int(pid), int(pn), str(path), str(text), float(score)) for pid, pn, path, text, score in rows]
 
-    items = [
-        Evidence(int(pid), int(pn), str(path), str(text), float(score))
-        for pid, pn, path, text, score in rows
-    ]
-
-    # Always show compact evidence table
     table = Table(title=f"Evidence ({mode}) for: {question!r} (showing {len(items)})")
     table.add_column("#", justify="right")
     table.add_column("paper_id", justify="right")
     table.add_column("page", justify="right")
     table.add_column("file")
     for i, e in enumerate(items, start=1):
-        table.add_row(
-            str(i),
-            str(e.paper_id),
-            str(e.page_num),
-            _cap_filename(Path(e.path).name, 30),
-        )
+        table.add_row(str(i), str(e.paper_id), str(e.page_num), _cap_filename(Path(e.path).name, 30))
     console.print(table)
 
-    # If there's no evidence, don't hallucinate
     if not items:
         answer = "Not found in the provided papers."
         print(answer)
@@ -519,7 +465,7 @@ def ask(
     system = (
         "You are Paperbrace. Answer ONLY using the provided evidence. "
         "Cite claims with bracketed numbers like [1] or [2]. "
-        "If the evidence is insufficient, say: \"Not found in the provided papers.\""
+        'If the evidence is insufficient, say: "Not found in the provided papers."'
     )
 
     blocks: list[str] = []
@@ -527,9 +473,7 @@ def ask(
         excerpt = (e.text or "").strip()
         if len(excerpt) > 1200:
             excerpt = excerpt[:1200] + "…"
-        blocks.append(
-            f"[{i}] paper_id={e.paper_id} page={e.page_num} file={Path(e.path).name}\n{excerpt}"
-        )
+        blocks.append(f"[{i}] paper_id={e.paper_id} page={e.page_num} file={Path(e.path).name}\n{excerpt}")
 
     user = (
         f"Question: {question}\n\n"

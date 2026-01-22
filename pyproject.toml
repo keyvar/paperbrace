@@ -9,6 +9,17 @@ dependencies = [
   "sqlite-utils>=3.36",
 ]
 
+[project.optional-dependencies]
+chroma = [
+  "chromadb",
+  "sentence-transformers",
+]
+sqlitevec = [
+  "sqlite-vec",
+  "sentence-transformers",
+  "pysqlite3-binary",
+]
+
 [build-system]
 requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
