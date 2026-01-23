@@ -1,3 +1,4 @@
+# src/paperbrace/cli.py
 from __future__ import annotations
 
 import logging
@@ -13,7 +14,8 @@ from paperbrace.db import connect, init_db
 from paperbrace.llm_client import LLMConfig, generate as llm_generate
 from paperbrace.render import Evidence, to_markdown
 from paperbrace import store
-from paperbrace.paths import DEFAULT_DB, DEFAULT_CHROMA_DIR, DEFAULT_SQLITEVEC_DB
+from paperbrace.paths import DEFAULT_DB, DEFAULT_CHROMA_DIR, DEFAULT_FLAT_DIR
+from paperbrace.retriever import make_retriever
 
 logger = logging.getLogger("paperbrace")
 console = Console()
@@ -255,13 +257,13 @@ def embed(
     backend: str = typer.Option(
         "chroma",
         "--backend",
-        help="Vector backend: chroma | sqlitevec",
+        help="Vector backend: chroma | flat",
     ),
     force: bool = typer.Option(False, "--force", help="Re-embed even if up-to-date."),
     commit_every: int = typer.Option(5, "--commit-every", min=1, max=200),
     chroma_db_path: Path = typer.Option(DEFAULT_CHROMA_DIR, "--chroma-db-path", help="Chroma persistence directory."),
-    sqlite_vec_db_path: Path = typer.Option(DEFAULT_SQLITEVEC_DB, "--sqlite-vec-db-path", help="sqlite-vec DB path."),
-    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection name (backend-specific)."),
+    flat_index_dir: Path = typer.Option(DEFAULT_FLAT_DIR, "--flat-index-dir", help="Flat index directory."),
+    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection/index name (backend-specific)."),
     embedding_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--embedding-model"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
@@ -274,12 +276,12 @@ def embed(
         paper_id: Single paper id to embed (0 means use --all).
         all_: Embed all extracted papers.
         db_path: SQLite DB file path (papers/pages).
-        backend: Vector backend: chroma or sqlitevec.
+        backend: Vector backend: chroma or flat.
         force: Re-embed even if unchanged.
         commit_every: Commit frequency for embed bookkeeping.
         chroma_db_path: Where Chroma persists its index.
-        sqlite_vec_db_path: Separate SQLite DB file for sqlite-vec vectors.
-        collection: Collection name for the backend.
+        flat_index_dir: Where the flat index persists (embeddings + metadata).
+        collection: Collection/index name for the backend.
         embedding_model: Embedding model id for SentenceTransformers.
         verbose: Enable debug logging.
 
@@ -290,27 +292,14 @@ def embed(
     conn = connect(db_path)
     init_db(conn)
 
-    b = (backend or "").strip().lower()
-    if b not in {"chroma", "sqlitevec"}:
-        raise typer.BadParameter("Invalid --backend. Use: chroma | sqlitevec")
-
-    # Lazy imports so optional deps don't load unless selected.
-    if b == "chroma":
-        from paperbrace.chroma_retriever import ChromaPageRetriever  # type: ignore
-
-        retr = ChromaPageRetriever(
-            persist_dir=chroma_db_path.expanduser().resolve(),
-            collection=collection,
-            embedding_model=embedding_model,
-        )
-    else:
-        from paperbrace.sqlitevec_retriever import SqliteVecPageRetriever  # type: ignore
-
-        retr = SqliteVecPageRetriever(
-            db_path=sqlite_vec_db_path.expanduser().resolve(),
-            table=collection,
-            embedding_model=embedding_model,
-        )
+    retr = make_retriever(
+        backend=backend,
+        chroma_db_path=chroma_db_path.expanduser().resolve(),
+        flat_index_dir=flat_index_dir.expanduser().resolve(),
+        collection=collection,
+        embedding_model=embedding_model,
+        db_path=db_path,
+    )
 
     if all_ == (paper_id != 0):
         raise typer.BadParameter("Use either --paper-id ID or --all (not both).")
@@ -340,17 +329,20 @@ def ask(
     config: Optional[Path] = typer.Option(None, "--config", help="Path to paperbrace.toml (default: ./paperbrace.toml)."),
     out: Optional[Path] = typer.Option(None, "--out", help="Write answer + evidence to Markdown."),
     db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path (papers/pages)."),
-    backend: str = typer.Option("chroma", "--backend", help="Vector backend for semantic/hybrid: chroma | sqlitevec"),
+    backend: str = typer.Option(
+        "auto",
+        "--backend",
+        help="Vector backend for semantic/hybrid: auto | chroma | flat",
+    ),
     chroma_db_path: Path = typer.Option(DEFAULT_CHROMA_DIR, "--chroma-db-path", help="Chroma persistence directory."),
-    sqlite_vec_db_path: Path = typer.Option(DEFAULT_SQLITEVEC_DB, "--sqlite-vec-db-path", help="sqlite-vec DB path."),
-    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection/table name for the backend."),
+    flat_index_dir: Path = typer.Option(Path(".paperbrace/flat"), "--flat-index-dir", help="Flat index directory."),
+    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection name (backend-specific)."),
     embedding_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--embedding-model"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
     Answer a question using retrieved evidence + a local Hugging Face LLM.
 
-    This command is LLM-only: if no model is configured/resolved, it exits.
     For pure keyword lookup without an LLM, use `paperbrace search`.
 
     Retrieval modes:
@@ -358,23 +350,10 @@ def ask(
       - semantic: vector search over embedded pages (requires `paperbrace embed`).
       - hybrid: semantic results first, then keyword fill; de-duped by (paper_id, page_num).
 
-    Args:
-        question: Natural-language question.
-        k: Number of evidence pages.
-        retriever: keyword | semantic | hybrid.
-        model: HF model id (override).
-        config: TOML config file path.
-        out: Optional Markdown output path.
-        db_path: SQLite DB file path.
-        backend: Vector backend for semantic/hybrid.
-        chroma_db_path: Chroma persistence directory.
-        sqlite_vec_db_path: sqlite-vec DB file path.
-        collection: Collection/table name.
-        embedding_model: Embedding model id.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
+    Vector backends (for semantic/hybrid):
+      - chroma: persistent Chroma DB (requires `paperbrace[chroma]`)
+      - flat: local NumPy index (requires `paperbrace[flat]`)
+      - auto: prefer chroma if installed, else flat if installed
     """
     setup_logging(verbose)
     conn = connect(db_path)
@@ -400,27 +379,21 @@ def ask(
         rows = store.get_evidence_pages(conn, query=question, limit=k)
 
     else:
-        b = (backend or "").strip().lower()
-        if b not in {"chroma", "sqlitevec"}:
-            raise typer.BadParameter("Invalid --backend. Use: chroma | sqlitevec")
+        # IMPORTANT: semantic/hybrid goes through make_retriever (no chromadb-only logic here)
+        from paperbrace.retriever import make_retriever
 
-        # Lazy imports to keep deps optional
-        if b == "chroma":
-            from paperbrace.chroma_retriever import ChromaPageRetriever  # type: ignore
-
-            vec = ChromaPageRetriever(
-                persist_dir=chroma_db_path.expanduser().resolve(),
+        try:
+            vec = make_retriever(
+                backend=backend,
+                chroma_db_path=chroma_db_path.expanduser().resolve(),
+                flat_index_dir=flat_index_dir.expanduser().resolve(),
                 collection=collection,
                 embedding_model=embedding_model,
+                db_path=db_path,
             )
-        else:
-            from paperbrace.sqlitevec_retriever import SqliteVecPageRetriever  # type: ignore
-
-            vec = SqliteVecPageRetriever(
-                db_path=sqlite_vec_db_path.expanduser().resolve(),
-                table=collection,
-                embedding_model=embedding_model,
-            )
+        except Exception as e:
+            logger.error("%s", e)
+            raise typer.Exit(code=2)
 
         sem_hits = vec.query_pages(question, k=k, where=None)
         sem_rows = [(h.paper_id, h.page_num, h.path, h.text, float(h.score)) for h in sem_hits]
@@ -494,6 +467,7 @@ def ask(
     if out:
         out.write_text(to_markdown(question, items, answer=answer), encoding="utf-8")
         logger.info("Wrote → %s", out)
+
 
 
 if __name__ == "__main__":

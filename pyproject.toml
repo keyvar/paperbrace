@@ -14,10 +14,9 @@ chroma = [
   "chromadb",
   "sentence-transformers",
 ]
-sqlitevec = [
-  "sqlite-vec",
+flat = [
+  "numpy",
   "sentence-transformers",
-  "pysqlite3-binary",
 ]
 
 [build-system]
