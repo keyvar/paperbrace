@@ -4,13 +4,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
+
 @dataclass(frozen=True)
 class Evidence:
-    paper_id: int
+    source_id: int
     page_num: int
     path: str
     text: str
-    score: float
+    distance: float
+    chunk_id: Optional[int] = None
+    char_start: Optional[int] = None
+    char_end: Optional[int] = None
+    fingerprint: Optional[str] = ""
+    retrieval: Optional[str] = ""
 
 def to_markdown(
     question: str,
@@ -44,7 +50,7 @@ def to_markdown(
           - Title
           - Question
           - Optional Answer
-          - Evidence blocks, each including paper_id, page number, filename, and excerpt
+          - Evidence blocks, each including source_id, page number, filename, and excerpt
           - If `items` is empty, an Evidence section with a "No matching evidence" note.
     """
 
@@ -67,7 +73,7 @@ def to_markdown(
         if len(excerpt) > max_chars_per_item:
             excerpt = excerpt[:max_chars_per_item] + "…"
 
-        lines.append(f"### [{i}] paper_id={e.paper_id} page={e.page_num} — {fname}\n")
+        lines.append(f"### [{i}] source_id={e.source_id} page={e.page_num} — {fname}\n")
         lines.append("```text")
         lines.append(excerpt)
         lines.append("```")

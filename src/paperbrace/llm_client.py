@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 import os
+import torch
+import logging
+
+logger = logging.getLogger("paperbrace")
+
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 _MODEL_CACHE: dict[str, Any] = {}
@@ -68,7 +73,6 @@ def generate(
     Uses chat templates when the tokenizer supports them. :contentReference[oaicite:0]{index=0}
     Uses max_new_tokens as the preferred length control. :contentReference[oaicite:1]{index=1}
     """
-    import torch
 
     tok, m, device = _load(cfg.model)
 
@@ -85,6 +89,7 @@ def generate(
     temperature = float(gen_kwargs.pop("temperature", cfg.temperature))
     max_new_tokens = int(gen_kwargs.pop("max_new_tokens", cfg.max_new_tokens))
 
+    logger.info(f"Generating with {cfg.model}")
     with torch.no_grad():
         out = m.generate(
             **inputs,

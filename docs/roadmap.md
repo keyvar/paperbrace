@@ -17,7 +17,7 @@
 - [ ] Key claims with supporting evidence
 
 ## L2 — Multi-paper queries + comparison tables
-- [ ] “Which papers improve over Y?” → ranked list + structured table (with citations)
+- [ ] “Which sources improve over Y?” → ranked list + structured table (with citations)
 - [ ] “Compare A vs B” → matrix with citations
 
 ## L3 — Router/orchestrator
@@ -28,4 +28,4 @@
 
 ## L5 — Local citation graph
 - [ ] Build citation graph from local metadata (BibTeX/JSON)
-- [ ] “Related papers in my library” (citations/authors/keywords + embeddings)
+- [ ] “Related sources in my library” (citations/authors/keywords + embeddings)

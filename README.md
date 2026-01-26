@@ -32,7 +32,7 @@ Ask things like:
 **L0 (Search + Cite MVP)**.
 
 - Index a folder of PDFs into a local SQLite DB
-- List papers
+- List sources
 - Extract per-page text into the DB
 
 ---

@@ -51,8 +51,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     Ensure the database schema exists and apply lightweight additive migrations.
 
     Creates:
-      - papers: one row per PDF (file path + file metadata + extraction markers)
-      - pages: extracted text per page (paper_id, page_num) -> text
+      - sources: one row per PDF (file path + file metadata + extraction markers)
+      - pages: extracted text per page (source_id, page_num) -> text
       - pages_fts: FTS5 full-text index over page text (keyword retrieval)
 
     Lightweight migrations (additive):
@@ -74,7 +74,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     # Base tables (fresh install)
     conn.executescript(
         """
-        CREATE TABLE IF NOT EXISTS papers (
+        CREATE TABLE IF NOT EXISTS sources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             path TEXT NOT NULL UNIQUE,
             mtime REAL NOT NULL,
@@ -85,17 +85,26 @@ def init_db(conn: sqlite3.Connection) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS pages (
-            paper_id INTEGER NOT NULL,
+            source_id INTEGER NOT NULL,
             page_num INTEGER NOT NULL,
             text TEXT NOT NULL,
-            PRIMARY KEY (paper_id, page_num),
-            FOREIGN KEY (paper_id) REFERENCES papers(id) ON DELETE CASCADE
+            PRIMARY KEY (source_id, page_num),
+            FOREIGN KEY (source_id) REFERENCES sources(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS vector_indexes (
+            backend TEXT NOT NULL,
+            collection_name TEXT NOT NULL,  -- e.g. paperbrace_pages
+            distance TEXT NOT NULL,              -- cosine | l2 | ip
+            embedding_model TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (backend, collection_name)
         );
         """
     )
 
     # Additive migration: track embedding freshness (semantic index)
-    _add_column(conn, "papers", "embedded_mtime", "REAL")
+    _add_column(conn, "sources", "embedded_mtime", "REAL")
 
     # Additive migration: keyword index
     if not _table_exists(conn, "pages_fts"):
@@ -104,7 +113,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             CREATE VIRTUAL TABLE pages_fts
             USING fts5(
                 text,
-                paper_id UNINDEXED,
+                source_id UNINDEXED,
                 page_num UNINDEXED
             );
             """

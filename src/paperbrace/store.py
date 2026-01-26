@@ -5,11 +5,11 @@ import re
 import sqlite3
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import typer
 
-from .retriever import PageForIndex, Retriever
+from paperbrace.retriever import ChunkForIndex, Retriever
 
 try:
     import fitz  # PyMuPDF
@@ -81,10 +81,10 @@ def iter_pdfs(pdf_dir: Path) -> Iterable[Path]:
 
 def index_pdfs(conn: sqlite3.Connection, pdf_dir: Path, commit_every: int = 200) -> int:
     """
-    Scan a PDF directory and upsert file metadata into the `papers` table.
+    Scan a PDF directory and upsert file metadata into the `sources` table.
 
     - Recursively finds *.pdf under pdf_dir.
-    - Upserts (path, mtime, size) into `papers`.
+    - Upserts (path, mtime, size) into `sources`.
     - Does not extract text; it only records file-level metadata.
     - Commits periodically and once at the end.
 
@@ -109,7 +109,7 @@ def index_pdfs(conn: sqlite3.Connection, pdf_dir: Path, commit_every: int = 200)
 
         conn.execute(
             """
-            INSERT INTO papers (path, mtime, size)
+            INSERT INTO sources (path, mtime, size)
             VALUES (?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 mtime=excluded.mtime,
@@ -130,9 +130,9 @@ def index_pdfs(conn: sqlite3.Connection, pdf_dir: Path, commit_every: int = 200)
     return n
 
 
-def list_papers(conn: sqlite3.Connection, limit: int = 20):
+def list_sources(conn: sqlite3.Connection, limit: int = 20):
     """
-    Return known papers (id + path + extracted_mtime), for display.
+    Return known sources (id + path + extracted_mtime), for display.
 
     Args:
         conn: Open SQLite connection.
@@ -142,46 +142,46 @@ def list_papers(conn: sqlite3.Connection, limit: int = 20):
         List of rows: (id, path, extracted_mtime)
     """
     return conn.execute(
-        "SELECT id, path, extracted_mtime FROM papers ORDER BY id LIMIT ?",
+        "SELECT id, path, extracted_mtime FROM sources ORDER BY id LIMIT ?",
         (limit,),
     ).fetchall()
 
 
-def extract_one(conn: sqlite3.Connection, paper_id: int, force: bool) -> tuple[bool, int]:
+def extract_one(conn: sqlite3.Connection, source_id: int, force: bool) -> tuple[bool, int]:
     """
     Extract per-page text for a single paper into the DB (and update FTS index).
 
     Behavior:
-      - Looks up the paper by id in `papers`.
+      - Looks up the paper by id in `sources`.
       - If not forced and extracted_mtime == file mtime, skips extraction.
       - Otherwise deletes existing rows for that paper from `pages` and `pages_fts`,
         re-opens the PDF, and inserts one row per page into both tables.
-      - Updates `papers.extracted_mtime` to match the current file mtime.
+      - Updates `sources.extracted_mtime` to match the current file mtime.
 
     Important:
       - Does NOT commit. Caller decides commit cadence (single vs batch).
 
     Args:
         conn: Open SQLite connection.
-        paper_id: Row id from the `papers` table.
+        source_id: Row id from the `sources` table.
         force: If True, re-extract even if up-to-date.
 
     Returns:
         (skipped, page_count)
 
     Raises:
-        typer.BadParameter: if PyMuPDF is unavailable or paper_id not found.
+        typer.BadParameter: if PyMuPDF is unavailable or source_id not found.
     """
     if fitz is None:
         raise typer.BadParameter("PyMuPDF not available. Did you install pymupdf?")
 
     row = conn.execute(
-        "SELECT path, mtime, extracted_mtime FROM papers WHERE id=?",
-        (paper_id,),
+        "SELECT path, mtime, extracted_mtime FROM sources WHERE id=?",
+        (source_id,),
     ).fetchone()
 
     if not row:
-        raise typer.BadParameter(f"No paper with id={paper_id}. Run `paperbrace list`.")
+        raise typer.BadParameter(f"No paper with id={source_id}. Run `paperbrace list`.")
 
     path_str, mtime, extracted_mtime = row
     pdf_path = Path(path_str)
@@ -191,51 +191,51 @@ def extract_one(conn: sqlite3.Connection, paper_id: int, force: bool) -> tuple[b
         return True, 0
 
     # Clear existing rows for this paper (keep pages + FTS in sync)
-    conn.execute("DELETE FROM pages WHERE paper_id=?", (paper_id,))
-    conn.execute("DELETE FROM pages_fts WHERE paper_id=?", (paper_id,))
+    conn.execute("DELETE FROM pages WHERE source_id=?", (source_id,))
+    conn.execute("DELETE FROM pages_fts WHERE source_id=?", (source_id,))
 
     doc = fitz.open(str(pdf_path))
     for i in range(doc.page_count):
         page = doc.load_page(i)
         text = page.get_text("text") or ""
         conn.execute(
-            "INSERT INTO pages (paper_id, page_num, text) VALUES (?, ?, ?)",
-            (paper_id, i + 1, text),
+            "INSERT INTO pages (source_id, page_num, text) VALUES (?, ?, ?)",
+            (source_id, i + 1, text),
         )
         conn.execute(
-            "INSERT INTO pages_fts (text, paper_id, page_num) VALUES (?, ?, ?)",
-            (text, paper_id, i + 1),
+            "INSERT INTO pages_fts (text, source_id, page_num) VALUES (?, ?, ?)",
+            (text, source_id, i + 1),
         )
 
     conn.execute(
-        "UPDATE papers SET extracted_mtime=?, updated_at=datetime('now') WHERE id=?",
-        (float(mtime), paper_id),
+        "UPDATE sources SET extracted_mtime=?, updated_at=datetime('now') WHERE id=?",
+        (float(mtime), source_id),
     )
-    logger.info("Extracted %d pages → paper_id=%s (%s)", doc.page_count, paper_id, pdf_path.name)
+    logger.info("Extracted %d pages → source_id=%s (%s)", doc.page_count, source_id, pdf_path.name)
     return False, doc.page_count
 
 
 def extract_all(conn: sqlite3.Connection, force: bool, commit_every: int = 5) -> tuple[int, int]:
     """
-    Extract per-page text for all papers in the DB.
+    Extract per-page text for all sources in the DB.
 
-    Skips up-to-date papers unless force=True. Commits periodically.
+    Skips up-to-date sources unless force=True. Commits periodically.
 
     Args:
         conn: Open SQLite connection.
         force: Re-extract even if up-to-date.
-        commit_every: Commit frequency (in number of papers processed; 0 disables intermediate commits).
+        commit_every: Commit frequency (in number of sources processed; 0 disables intermediate commits).
 
     Returns:
         (extracted_count, skipped_count)
     """
-    rows = conn.execute("SELECT id FROM papers ORDER BY id").fetchall()
+    rows = conn.execute("SELECT id FROM sources ORDER BY id").fetchall()
     ids = [int(r[0]) for r in rows]
-    logger.info("Extracting %d papers (commit every %d)...", len(ids), commit_every)
+    logger.info("Extracting %d sources (commit every %d)...", len(ids), commit_every)
 
     extracted = skipped = 0
-    for i, pid in enumerate(ids, start=1):
-        was_skipped, _ = extract_one(conn, paper_id=pid, force=force)
+    for i, sid in enumerate(ids, start=1):
+        was_skipped, _ = extract_one(conn, source_id=sid, force=force)
         skipped += int(was_skipped)
         extracted += int(not was_skipped)
 
@@ -249,25 +249,25 @@ def extract_all(conn: sqlite3.Connection, force: bool, commit_every: int = 5) ->
 
 def purge_db(conn: sqlite3.Connection, reset_ids: bool = True, vacuum: bool = False) -> None:
     """
-    Delete all data from the DB (papers/pages/pages_fts) and optionally reset ids.
+    Delete all data from the DB (sources/pages/pages_fts) and optionally reset ids.
 
     Note: this does NOT delete any semantic vector store (e.g., Chroma persist dir).
     For a fully clean slate you may also delete the vector store directory.
 
     Args:
         conn: Open SQLite connection.
-        reset_ids: If True, resets AUTOINCREMENT counter for papers.
+        reset_ids: If True, resets AUTOINCREMENT counter for sources.
         vacuum: If True, runs VACUUM to reclaim space (can take time).
     """
     # Keep FTS + pages in sync
     conn.execute("DELETE FROM pages_fts;")
     conn.execute("DELETE FROM pages;")
-    conn.execute("DELETE FROM papers;")
+    conn.execute("DELETE FROM sources;")
 
     if reset_ids:
         # sqlite_sequence may not exist on a brand new DB; ignore if missing
         try:
-            conn.execute("DELETE FROM sqlite_sequence WHERE name='papers';")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='sources';")
         except sqlite3.OperationalError:
             pass
 
@@ -289,20 +289,20 @@ def search_pages(conn: sqlite3.Connection, query: str, limit: int = 10):
 
     Returns:
         List of rows:
-          (paper_id, page_num, path, snippet, score)
+          (source_id, page_num, path, snippet, distance)
     """
     return conn.execute(
         """
         SELECT
-          pages_fts.paper_id,
+          pages_fts.source_id,
           pages_fts.page_num,
-          papers.path,
+          sources.path,
           snippet(pages_fts, 0, '[', ']', '…', 12) AS snip,
-          bm25(pages_fts) AS score
+          bm25(pages_fts) AS distance
         FROM pages_fts
-        JOIN papers ON papers.id = pages_fts.paper_id
+        JOIN sources ON sources.id = pages_fts.source_id
         WHERE pages_fts MATCH ?
-        ORDER BY score
+        ORDER BY distance
         LIMIT ?
         """,
         (query, limit),
@@ -317,60 +317,60 @@ def get_evidence_pages(conn: sqlite3.Connection, query: str, limit: int = 8):
     the full extracted text.
 
     Returns rows:
-      (paper_id, page_num, path, text, score)
+      (source_id, page_num, path, text, distance)
     """
     fts_query = nl_to_fts_query(query)
 
     return conn.execute(
         """
         SELECT
-          f.paper_id,
+          f.source_id,
           f.page_num,
           p.path,
           pg.text,
-          f.score
+          f.distance
         FROM (
           SELECT
-            pages_fts.paper_id AS paper_id,
+            pages_fts.source_id AS source_id,
             pages_fts.page_num AS page_num,
-            bm25(pages_fts) AS score
+            bm25(pages_fts) AS distance
           FROM pages_fts
           WHERE pages_fts MATCH ?
-          ORDER BY score
+          ORDER BY distance
           LIMIT ?
         ) AS f
-        JOIN papers p ON p.id = f.paper_id
-        JOIN pages  pg ON pg.paper_id = f.paper_id AND pg.page_num = f.page_num
-        ORDER BY f.score
+        JOIN sources p ON p.id = f.source_id
+        JOIN pages  pg ON pg.source_id = f.source_id AND pg.page_num = f.page_num
+        ORDER BY f.distance
         """,
         (fts_query, limit),
     ).fetchall()
 
 
-def iter_pages_for_paper(conn: sqlite3.Connection, paper_id: int) -> list[PageForIndex]:
+def iter_pages_for_paper(conn: sqlite3.Connection, source_id: int) -> list[ChunkForIndex]:
     """
-    Load all extracted pages for a given paper_id and convert them to PageForIndex.
+    Load all extracted pages for a given source_id and convert them to ChunkForIndex.
 
     Args:
         conn: Open SQLite connection.
-        paper_id: Paper id.
+        source_id: Source id.
 
     Returns:
-        List of PageForIndex (one per page).
+        List of ChunkForIndex (one per page).
     """
-    row = conn.execute("SELECT path FROM papers WHERE id=?", (paper_id,)).fetchone()
+    row = conn.execute("SELECT path FROM sources WHERE id=?", (source_id,)).fetchone()
     if not row:
-        raise typer.BadParameter(f"No paper with id={paper_id}. Run `paperbrace list`.")
+        raise typer.BadParameter(f"No paper with id={source_id}. Run `paperbrace list`.")
     (path_str,) = row
 
     rows = conn.execute(
-        "SELECT page_num, text FROM pages WHERE paper_id=? ORDER BY page_num",
-        (paper_id,),
+        "SELECT page_num, text FROM pages WHERE source_id=? ORDER BY page_num",
+        (source_id,),
     ).fetchall()
 
     return [
-        PageForIndex(
-            paper_id=int(paper_id),
+        ChunkForIndex(
+            source_id=int(source_id),
             page_num=int(page_num),
             path=str(path_str),
             text=str(text),
@@ -379,74 +379,238 @@ def iter_pages_for_paper(conn: sqlite3.Connection, paper_id: int) -> list[PageFo
     ]
 
 
+def set_vector_index(
+    conn,
+    *,
+    backend: str,
+    distance: str,
+    collection_name: str,
+    embedding_model: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO vector_indexes(backend, collection_name, distance, embedding_model)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(backend, collection_name) DO UPDATE SET
+          collection_name=excluded.collection_name,
+          distance=excluded.distance,
+          embedding_model=excluded.embedding_model,
+          updated_at=datetime('now')
+        """,
+        (backend, collection_name, distance, embedding_model),
+    )
+
+
+def get_vector_index(
+    conn,
+    *,
+    backend: str,
+    collection_name: str,
+) -> Optional[tuple[str, str, str]]:
+    """
+    Returns (collection_name, distance, embedding_model) or None.
+    """
+    row = conn.execute(
+        """
+        SELECT collection_name, distance, embedding_model
+        FROM vector_indexes
+        WHERE backend=? AND collection_name=?
+        """,
+        (backend, collection_name),
+    ).fetchone()
+    if not row:
+        return None
+    return (str(row[0]), str(row[1]), str(row[2]))
+
+
 def embed_one(
     conn: sqlite3.Connection,
     retriever: Retriever,
-    paper_id: int,
+    source_id: int,
     force: bool,
+    *,
+    chunk_size: int = 900,
+    chunk_overlap: int = 150,
+    min_chunk_chars: int = 200,
 ) -> tuple[bool, int]:
     """
-    Embed pages for a single paper into the semantic retriever (e.g., Chroma).
+    Embed chunked page text for a single paper into the semantic retriever.
 
-    Behavior:
-      - Requires extracted pages to exist in `pages`.
-      - Skips if up-to-date and not forced:
-          embedded_mtime == extracted_mtime
-      - Otherwise deletes old vectors for this paper (via retriever.delete_paper),
-        upserts all pages (retriever.upsert_pages), and updates papers.embedded_mtime.
+    This is the chunking-aware version of embedding:
+
+    - Reads extracted pages from SQLite `pages` for `source_id`.
+    - Splits each page's text into overlapping character chunks (configurable).
+    - Deletes any existing vectors for this paper (retriever.delete_source).
+    - Upserts all chunks (retriever.upsert_source).
+    - Updates `sources.embedded_mtime` to match `sources.extracted_mtime`.
+
+    Notes / expectations:
+      - Changing chunk parameters (chunk_size/overlap/min_chunk_chars) does NOT
+        automatically invalidate `embedded_mtime`. If you change chunking, run
+        embed with `--force` (or pass force=True).
+      - This function assumes your `ChunkForIndex` supports chunk metadata fields:
+          - chunk_id: int
+          - char_start: int
+          - char_end: int
+          - fingerprint: str
+        If your current `ChunkForIndex` does not have these yet, add them as
+        optional fields (retrievers can ignore what they don't use).
 
     Important:
       - Does NOT commit. Caller controls commit cadence.
 
     Args:
         conn: Open SQLite connection.
-        retriever: A semantic retriever backend (Chroma now; others later).
-        paper_id: Paper id.
+        retriever: A semantic retriever backend (e.g., Chroma or Flat).
+        source_id: Source id to embed.
         force: If True, re-embed even if up-to-date.
+        chunk_size: Target chunk size in characters (<=0 disables chunking; whole page as one chunk).
+        chunk_overlap: Overlap between consecutive chunks in characters.
+        min_chunk_chars: Drop chunks shorter than this (after trimming).
 
     Returns:
-        (skipped, page_count)
-          skipped: True if embeddings were skipped as up-to-date.
-          page_count: number of pages embedded (0 if skipped).
+        (skipped, item_count)
+          skipped: True if embedding was skipped as up-to-date or not possible.
+          item_count: number of chunks embedded (0 if skipped).
 
     Raises:
-        typer.BadParameter if paper_id not found.
+        typer.BadParameter: if source_id not found.
     """
+    import hashlib
+
+    def _sha1(s: str) -> str:
+        return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _chunk_text(text: str) -> list[tuple[int, int, str]]:
+        """
+        Return list of (char_start, char_end, chunk_text) over `text`.
+
+        We try to end chunks on whitespace/newline when possible for cleaner chunks.
+        Offsets are relative to the original `text` (before trimming).
+        """
+        t = text or ""
+        n = len(t)
+        if chunk_size <= 0 or n <= chunk_size:
+            chunk = t.strip()
+            if len(chunk) < min_chunk_chars and n > 0:
+                # allow very small pages; otherwise they'd vanish
+                return [(0, n, t)]
+            return [(0, n, t)]
+
+        out: list[tuple[int, int, str]] = []
+        i = 0
+        # guard overlap
+        ov = max(0, min(int(chunk_overlap), max(0, chunk_size - 1)))
+        # how far back we search for a "nice" break near the end
+        backtrack = 200
+
+        while i < n:
+            j = min(i + chunk_size, n)
+
+            # try to break at whitespace near the end for readability
+            if j < n:
+                lo = max(i + min_chunk_chars, j - backtrack)
+                cut = -1
+                for k in range(j - 1, lo - 1, -1):
+                    if t[k].isspace():
+                        cut = k + 1
+                        break
+                if cut != -1 and cut > i:
+                    j = cut
+
+            raw = t[i:j]
+            # preserve offsets into the original text while trimming
+            ltrim = len(raw) - len(raw.lstrip())
+            rtrim = len(raw) - len(raw.rstrip())
+            start = i + ltrim
+            end = j - rtrim
+            chunk_txt = t[start:end]
+
+            if len(chunk_txt) >= min_chunk_chars or (n <= chunk_size):
+                out.append((start, end, chunk_txt))
+
+            # advance with overlap (ensure progress)
+            next_i = max(end - ov, i + 1)
+            if next_i <= i:
+                next_i = j
+            i = next_i
+
+        # if everything got filtered out, fall back to whole page
+        if not out and n > 0:
+            out = [(0, n, t)]
+        return out
+
     row = conn.execute(
-        "SELECT path, extracted_mtime, embedded_mtime FROM papers WHERE id=?",
-        (paper_id,),
+        "SELECT path, extracted_mtime, embedded_mtime FROM sources WHERE id=?",
+        (source_id,),
     ).fetchone()
 
     if not row:
-        raise typer.BadParameter(f"No paper with id={paper_id}. Run `paperbrace list`.")
+        raise typer.BadParameter(f"No paper with id={source_id}. Run `paperbrace list`.")
 
     path_str, extracted_mtime, embedded_mtime = row
     pdf_name = Path(str(path_str)).name
 
     if extracted_mtime is None:
-        logger.info("Skip not extracted yet: paper_id=%d (%s)", paper_id, pdf_name)
+        logger.info("Skip not extracted yet: source_id=%d (%s)", source_id, pdf_name)
         return True, 0
 
     if (not force) and embedded_mtime is not None and float(embedded_mtime) == float(extracted_mtime):
-        logger.info("Skip already embedded (up-to-date): paper_id=%d (%s)", paper_id, pdf_name)
+        logger.info("Skip already embedded (up-to-date): source_id=%d (%s)", source_id, pdf_name)
         return True, 0
 
-    pages = iter_pages_for_paper(conn, paper_id)
+    pages = list(iter_pages_for_paper(conn, source_id))
     if not pages:
-        logger.info("Skip no extracted pages (run extract?): paper_id=%d (%s)", paper_id, pdf_name)
+        logger.info("Skip no extracted pages (run extract?): source_id=%d (%s)", source_id, pdf_name)
+        return True, 0
+
+    # Build chunk-level items for indexing
+    items: list[ChunkForIndex] = []
+    total_pages = 0
+
+    for p in pages:
+        total_pages += 1
+        page_text = p.text or ""
+        chunks = _chunk_text(page_text)
+
+        for chunk_id, (cs, ce, chunk_txt) in enumerate(chunks):
+            # If you haven’t added these fields to ChunkForIndex yet,
+            # add them as Optional[...] in the dataclass.
+            items.append(
+                ChunkForIndex(
+                    source_id=p.source_id,
+                    page_num=p.page_num,
+                    path=p.path,
+                    text=chunk_txt,
+                    chunk_id=chunk_id,
+                    char_start=cs,
+                    char_end=ce,
+                    fingerprint=_sha1(chunk_txt),
+                )
+            )
+
+    if not items:
+        logger.info("Skip no chunks produced: source_id=%d (%s)", source_id, pdf_name)
         return True, 0
 
     # Re-embed: delete then upsert
-    retriever.delete_paper(paper_id)
-    retriever.upsert_pages(pages)
+    retriever.delete_source(source_id)
+    retriever.upsert_source(items)
 
     conn.execute(
-        "UPDATE papers SET embedded_mtime=?, updated_at=datetime('now') WHERE id=?",
-        (float(extracted_mtime), paper_id),
+        "UPDATE sources SET embedded_mtime=?, updated_at=datetime('now') WHERE id=?",
+        (float(extracted_mtime), source_id),
     )
 
-    logger.info("Embedded %d pages → paper_id=%d (%s)", len(pages), paper_id, pdf_name)
-    return False, len(pages)
+    logger.info(
+        "Embedded %d chunks from %d pages → source_id=%d (%s)",
+        len(items),
+        total_pages,
+        source_id,
+        pdf_name,
+    )
+    return False, len(items)
+
 
 
 def embed_all(
@@ -456,28 +620,28 @@ def embed_all(
     commit_every: int = 5,
 ) -> tuple[int, int]:
     """
-    Embed pages for all extracted papers into the semantic retriever.
+    Embed pages for all extracted sources into the semantic retriever.
 
-    Skips up-to-date papers unless force=True. Commits periodically.
+    Skips up-to-date sources unless force=True. Commits periodically.
 
     Args:
         conn: Open SQLite connection.
         retriever: A semantic retriever backend (Chroma now; others later).
         force: Re-embed even if up-to-date.
-        commit_every: Commit frequency (in number of papers processed; 0 disables intermediate commits).
+        commit_every: Commit frequency (in number of sources processed; 0 disables intermediate commits).
 
     Returns:
         (embedded_count, skipped_count)
     """
     rows = conn.execute(
-        "SELECT id FROM papers WHERE extracted_mtime IS NOT NULL ORDER BY id"
+        "SELECT id FROM sources WHERE extracted_mtime IS NOT NULL ORDER BY id"
     ).fetchall()
     ids = [int(r[0]) for r in rows]
-    logger.info("Embedding %d papers (commit every %d)...", len(ids), commit_every)
+    logger.info("Embedding %d sources (commit every %d)...", len(ids), commit_every)
 
     embedded = skipped = 0
-    for i, pid in enumerate(ids, start=1):
-        was_skipped, _ = embed_one(conn, retriever=retriever, paper_id=pid, force=force)
+    for i, sid in enumerate(ids, start=1):
+        was_skipped, _ = embed_one(conn, retriever=retriever, source_id=sid, force=force)
         skipped += int(was_skipped)
         embedded += int(not was_skipped)
 

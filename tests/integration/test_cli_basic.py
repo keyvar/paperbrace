@@ -31,17 +31,17 @@ def _db_count(db_path: Path, sql: str, params=()) -> int:
         conn.close()
 
 
-def _first_paper_id(db_path: Path) -> int:
+def _first_source_id(db_path: Path) -> int:
     conn = sqlite3.connect(str(db_path))
     try:
-        row = conn.execute("SELECT id FROM papers ORDER BY id LIMIT 1").fetchone()
+        row = conn.execute("SELECT id FROM sources ORDER BY id LIMIT 1").fetchone()
         assert row is not None
         return int(row[0])
     finally:
         conn.close()
 
 
-def test_index_inserts_papers(tmp_path: Path):
+def test_index_inserts_sources(tmp_path: Path):
     pdf_dir = tmp_path / "pdfs"
     pdf_dir.mkdir()
     db = tmp_path / "paperbrace.db"
@@ -52,7 +52,7 @@ def test_index_inserts_papers(tmp_path: Path):
     r = runner.invoke(app, ["index", "--pdf-dir", str(pdf_dir), "--db", str(db)])
     assert r.exit_code == 0
 
-    assert _db_count(db, "SELECT COUNT(*) FROM papers") == 2
+    assert _db_count(db, "SELECT COUNT(*) FROM sources") == 2
 
 
 def test_extract_populates_pages(tmp_path: Path):
@@ -63,12 +63,12 @@ def test_extract_populates_pages(tmp_path: Path):
     _make_pdf(pdf_dir / "a.pdf", ["needle page1", "page2 text"])
     runner.invoke(app, ["index", "--pdf-dir", str(pdf_dir), "--db", str(db)])
 
-    pid = _first_paper_id(db)
-    r = runner.invoke(app, ["extract", "--paper-id", str(pid), "--db", str(db)])
+    sid = _first_source_id(db)
+    r = runner.invoke(app, ["extract", "--paper-id", str(sid), "--db", str(db)])
     assert r.exit_code == 0
 
-    assert _db_count(db, "SELECT COUNT(*) FROM pages WHERE paper_id=?", (pid,)) == 2
-    assert _db_count(db, "SELECT COUNT(*) FROM pages WHERE paper_id=? AND text LIKE '%needle%'", (pid,)) == 1
+    assert _db_count(db, "SELECT COUNT(*) FROM pages WHERE source_id=?", (sid,)) == 2
+    assert _db_count(db, "SELECT COUNT(*) FROM pages WHERE source_id=? AND text LIKE '%needle%'", (sid,)) == 1
 
 
 def test_extract_skips_when_uptodate(tmp_path: Path):
@@ -79,24 +79,24 @@ def test_extract_skips_when_uptodate(tmp_path: Path):
     _make_pdf(pdf_dir / "a.pdf", ["hello"])
     runner.invoke(app, ["index", "--pdf-dir", str(pdf_dir), "--db", str(db)])
 
-    pid = _first_paper_id(db)
-    runner.invoke(app, ["extract", "--paper-id", str(pid), "--db", str(db)])
+    sid = _first_source_id(db)
+    runner.invoke(app, ["extract", "--paper-id", str(sid), "--db", str(db)])
 
-    before = _db_count(db, "SELECT COUNT(*) FROM pages WHERE paper_id=?", (pid,))
-    r2 = runner.invoke(app, ["extract", "--paper-id", str(pid), "--db", str(db)])
-    after = _db_count(db, "SELECT COUNT(*) FROM pages WHERE paper_id=?", (pid,))
+    before = _db_count(db, "SELECT COUNT(*) FROM pages WHERE source_id=?", (sid,))
+    r2 = runner.invoke(app, ["extract", "--paper-id", str(sid), "--db", str(db)])
+    after = _db_count(db, "SELECT COUNT(*) FROM pages WHERE source_id=?", (sid,))
 
     assert r2.exit_code == 0
     assert before == after
     
     mtime1 = sqlite3.connect(str(db)).execute(
-    "SELECT extracted_mtime FROM papers WHERE id=?", (pid,)
+    "SELECT extracted_mtime FROM sources WHERE id=?", (sid,)
     ).fetchone()[0]
 
-    runner.invoke(app, ["extract", "--paper-id", str(pid), "--db", str(db)])
+    runner.invoke(app, ["extract", "--paper-id", str(sid), "--db", str(db)])
 
     mtime2 = sqlite3.connect(str(db)).execute(
-        "SELECT extracted_mtime FROM papers WHERE id=?", (pid,)
+        "SELECT extracted_mtime FROM sources WHERE id=?", (sid,)
     ).fetchone()[0]
 
     assert mtime1 == mtime2

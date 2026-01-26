@@ -74,7 +74,15 @@ With semantic retriever
 ```
 paperbrace ask "your question" --db paperbrace.db --retriever semantic
 ```
-You can also pass ```--retriever hybrid```
+You can also pass ```--retriever hybrid``` which appends keyword hits to **after** the list retrieved by semantic search.
+
+Hybrid is useful in a narrow high-value band:
+
+When the query is on-topic, semantic wins, so hybrid adds little. Also, when the query is off-topic, semantic hits with cutoff may return nothing, and hybrid may show irrelevant keyword matches, which should be indentified by the model as “not supported.”
+
+The real justification for hybrid is this specific failure mode:
+
+On-topic query, semantic misses, rare terms / acronyms / exact phrases, numbers / thresholds / formula-like strings, citation-style queries (“Table 2”, “Figure 3”, “AUROC 0.83”), extraction quirks where embeddings blur the exact token match.
 
 optional keyword to write into output file ```--out answer.md```
 

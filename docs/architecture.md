@@ -23,7 +23,7 @@
 5) **Answerer**
 - Generates answers only from retrieved evidence
 - If evidence is insufficient: refuses / asks to refine query
-- Outputs citations: (paper_id, page_num) + excerpt text
+- Outputs citations: (source_id, page_num) + excerpt text
 
 6) **UI**
 - CLI first
@@ -32,7 +32,7 @@
 ## Data flow (L0)
 
 PDF folder
-→ index metadata into `papers`
+→ index metadata into `sources`
 → extract per-page text into `pages`
 → query via FTS and fetch evidence passages
 → answer with citations
@@ -40,14 +40,14 @@ PDF folder
 ## Storage (current)
 
 SQLite tables:
-- `papers`: id, path, mtime, size, extracted_mtime, timestamps
-- `pages`: (paper_id, page_num) → text
+- `sources`: id, path, mtime, size, extracted_mtime, timestamps
+- `pages`: (source_id, page_num) → text
 
 Planned (L0):
 - `pages_fts` (FTS5) over page text for fast keyword search
 
 Planned (L0+):
-- `chunks`: chunk_id, paper_id, page_start/end, text
+- `chunks`: chunk_id, source_id, page_start/end, text
 - `embeddings`: chunk_id, vector (plus index)
 
 ## Key design constraints
