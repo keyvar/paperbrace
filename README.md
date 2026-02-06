@@ -2,6 +2,8 @@
 
 **Paperbrace** is a local-first literature navigator for a researcher’s PDF library (e.g., a Zotero attachments folder).
 
+**Disclaimer:** Paperbrace is experimental, work in progress software. Use at your own risk. It comes with no guarantees of any kind, including correctness, security or suitability for production. See the `LICENSE` and `docs/privacy.md` for more information.
+
 ## Goals
 
 - Index a local folder of PDFs and enable QA/navigation over the user’s library
@@ -54,18 +56,20 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -e .
-```
-Index PDFs:
-```
+
+```bash
+# Index PDFs:
 paperbrace index --pdf-dir /path/to/pdfs --db paperbrace.db
-```
-List:
-```
+
+# List:
 paperbrace list --db paperbrace.db
-```
-Extract:
-```
+
+# Extract:
 paperbrace extract --paper-id 1 --db paperbrace.db
 ```
+
 ## License
-TBD (MIT or Apache-2.0)
+MIT (see LICENSE)
+
+## Attribution (Optional)
+Attribution is not required. If you use Paperbrace in research or a public project and decide to give credit, you can credit it as: Keyvan Rahmani, *Paperbrace* (2026).
