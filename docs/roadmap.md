@@ -13,6 +13,7 @@
 - Every answer includes evidence snippets with page numbers
 
 ## L1 — Paper-level summaries (PaperCard)
+
 - [ ] PaperCard JSON + rendered view: problem / contributions / method / datasets/metrics / limitations
 - [ ] Key claims with supporting evidence
 

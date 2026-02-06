@@ -291,6 +291,7 @@ def search_pages(conn: sqlite3.Connection, query: str, limit: int = 10):
         List of rows:
           (source_id, page_num, path, snippet, distance)
     """
+    query = nl_to_fts_query(query)
     return conn.execute(
         """
         SELECT
@@ -651,3 +652,36 @@ def embed_all(
 
     conn.commit()
     return embedded, skipped
+
+
+def get_source_id_by_filename(conn, file_name: str) -> int:
+    """
+    Resolve a source id from a filename (basename), e.g. "imf_inequality_wp1920.pdf".
+
+    Matches by basename against sources.path. Raises if not found or ambiguous.
+    Works even if paths contain backslashes (Windows) by normalizing separators.
+    """
+    name = (file_name or "").strip()
+    if not name:
+        raise ValueError("file_name is empty")
+
+    def _basename(p: str) -> str:
+        return (p or "").replace("\\", "/").rsplit("/", 1)[-1]
+
+    # Cheap prefilter using LIKE, then exact basename match in Python.
+    rows = conn.execute(
+        "SELECT id, path FROM sources WHERE path LIKE ?",
+        (f"%{name}",),
+    ).fetchall()
+
+    matches = [(int(sid), str(path)) for sid, path in rows if _basename(str(path)) == name]
+
+    if not matches:
+        raise KeyError(f"No source found with filename={name!r}")
+
+    if len(matches) > 1:
+        # Safer to force uniqueness than silently pick one.
+        ids = [sid for sid, _ in matches]
+        raise ValueError(f"Ambiguous filename={name!r}; matches source_ids={ids}")
+
+    return matches[0][0]

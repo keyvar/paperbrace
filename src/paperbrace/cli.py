@@ -1,9 +1,11 @@
 # src/paperbrace/cli.py
 from __future__ import annotations
 
+import os
+import json
 import logging
 from pathlib import Path
-from typing import Optional, Tuple, TypeAlias, Any
+from typing import Any, Dict, List, Optional, Tuple, TypeAlias
 
 import typer
 from rich.console import Console
@@ -36,6 +38,10 @@ def setup_logging(verbose: bool) -> None:
         "chromadb",
         "huggingface_hub",
         "urllib3",
+        "httpx",
+        "httpcore",
+        "hpack",
+        "h2",
     ):
         logging.getLogger(name).setLevel(noisy_level)
 
@@ -49,6 +55,15 @@ def setup_logging(verbose: bool) -> None:
     except Exception:
         pass
 
+
+def _set_hf_offline(offline: bool) -> None:
+    """
+    Enforce zero-network for HF Hub / Transformers.
+    Must be called before instantiating SentenceTransformer / Transformers models.
+    """
+    if offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
 def _opt_int(x: Any) -> int | None:
@@ -91,6 +106,188 @@ def _cosine_equiv_distance(d: float, metric: str) -> float:
     return (d / 2.0) if m == "l2" else d
 
 
+# Row shape used by ask() / eval(): (source_id, page_num, chunk_id, char_start, char_end, fingerprint, path, text, distance, retrieval)
+Row: TypeAlias = Tuple[int, int, Optional[int], Optional[int], Optional[int], Optional[str], str, str, float, str]
+
+
+def _chunk_key(r: Row) -> tuple[int, int, Optional[int]]:
+    sid, pn, cid, *_ = r
+    return (int(sid), int(pn), cid)
+
+
+def _page_key(r: Row) -> tuple[int, int]:
+    sid, pn, *_ = r
+    return (int(sid), int(pn))
+
+
+def _backend_info(conn: Any, *, preferred_backend: str, base_collection: str) -> tuple[str, str, str]:
+    """
+    Return (backend, collection_name, distance_metric) from vector_indexes mapping.
+    Fallback: assume cosine on base collection if never embedded / mapping missing.
+    """
+    info = store.get_vector_index(conn, backend=preferred_backend, collection_name=base_collection)
+    if info:
+        col, dist, *_ = info
+        return preferred_backend, str(col), str(dist)
+    return preferred_backend, base_collection, "cosine"
+
+
+def _retrieve_rows(
+    *,
+    conn: Any,
+    question: str,
+    mode: str,
+    k: int,
+    backend: str,
+    db_path: Path,
+    chroma_db_path: Path,
+    flat_index_dir: Path,
+    collection: str,
+    embedding_model: str,
+    distance_cutoff: Optional[float],
+) -> tuple[list_cmd[Row], Optional[str]]:
+    """
+    Run retrieval (keyword/semantic/hybrid) and return (rows, semantic_metric_used).
+
+    semantic_metric_used is one of: "cosine" | "l2" | "ip" when semantic is involved; otherwise None.
+    """
+    b = (backend or "").strip().lower()
+    if b not in {"auto", "chroma", "flat"}:
+        raise typer.BadParameter("Invalid --backend. Use: auto | chroma | flat")
+
+    m = (mode or "").strip().lower()
+    if m not in {"keyword", "semantic", "hybrid"}:
+        raise typer.BadParameter("Invalid --retriever. Use: keyword | semantic | hybrid")
+
+    if m == "keyword":
+        kw_rows_raw = store.get_evidence_pages(conn, query=question, limit=k)
+        rows_kw: list_cmd[Row] = [
+            (int(sid), int(pn), None, None, None, "", str(path), str(text), float(distance), "keyword")
+            for sid, pn, path, text, distance in kw_rows_raw
+        ]
+        return rows_kw[:k], None
+
+    # Resolve which embedded mapping to use (auto tries chroma mapping first, else flat mapping)
+    if b == "auto":
+        if store.get_vector_index(conn, backend="chroma", collection_name=collection):
+            chosen_backend, chosen_collection, dist = _backend_info(conn, preferred_backend="chroma", base_collection=collection)
+        else:
+            chosen_backend, chosen_collection, dist = _backend_info(conn, preferred_backend="flat", base_collection=collection)
+    else:
+        chosen_backend, chosen_collection, dist = _backend_info(conn, preferred_backend=b, base_collection=collection)
+
+    vec = make_retriever(
+        backend=chosen_backend,
+        chroma_db_path=chroma_db_path.expanduser().resolve(),
+        flat_index_dir=flat_index_dir.expanduser().resolve(),
+        collection=chosen_collection,  # uses embedded metric collection
+        embedding_model=embedding_model,
+        db_path=db_path,
+        distance=dist,  # pass for flat validation / chroma creation
+    )
+
+    sem_hits = vec.query(question, k=k, where=None)
+
+    if distance_cutoff is not None:
+        sem_hits = [
+            h
+            for h in sem_hits
+            if _cosine_equiv_distance(float(h.distance), dist) <= distance_cutoff
+        ]
+
+    sem_rows: list_cmd[Row] = [
+        (
+            int(h.source_id),
+            int(h.page_num),
+            _opt_int(getattr(h, "chunk_id", None)),
+            _opt_int(getattr(h, "char_start", None)),
+            _opt_int(getattr(h, "char_end", None)),
+            getattr(h, "fingerprint", None),
+            str(h.path),
+            str(h.text),
+            float(h.distance),  # raw semantic distance from backend
+            "semantic",
+        )
+        for h in sem_hits
+    ]
+
+    if m == "semantic":
+        # Defensive dedupe on chunk key
+        seen: set[tuple[int, int, Optional[int]]] = set()
+        out: list_cmd[Row] = []
+        for r in sem_rows:
+            ck = _chunk_key(r)
+            if ck in seen:
+                continue
+            seen.add(ck)
+            out.append(r)
+            if len(out) >= k:
+                break
+        return out, dist
+
+    # Hybrid: semantic first, keyword fill after (page-level)
+    kw_rows_raw = store.get_evidence_pages(conn, query=question, limit=max(k * 2, k))
+    kw_rows: list_cmd[Row] = [
+        (int(sid), int(pn), None, None, None, "", str(path), str(text), float(distance), "keyword")
+        for sid, pn, path, text, distance in kw_rows_raw
+    ]
+
+    merged: list_cmd[Row] = []
+    seen_chunks: set[tuple[int, int, Optional[int]]] = set()
+    pages_with_semantic: set[tuple[int, int]] = set()
+
+    # 1) semantic first: dedupe by chunk key, also remember pages covered
+    for r in sem_rows:
+        ck = _chunk_key(r)
+        if ck in seen_chunks:
+            continue
+        seen_chunks.add(ck)
+        pages_with_semantic.add(_page_key(r))
+        merged.append(r)
+        if len(merged) >= k:
+            break
+
+    # 2) keyword fill: only add pages not already covered by semantic
+    if len(merged) < k:
+        for r in kw_rows:
+            pk = _page_key(r)
+            if pk in pages_with_semantic:
+                continue
+            ck = _chunk_key(r)  # (sid, pn, None)
+            if ck in seen_chunks:
+                continue
+            seen_chunks.add(ck)
+            merged.append(r)
+            if len(merged) >= k:
+                break
+
+    # Final defensive dedupe
+    seen2: set[tuple[int, int, Optional[int]]] = set()
+    out2: list_cmd[Row] = []
+    for r in merged:
+        ck = _chunk_key(r)
+        if ck in seen2:
+            continue
+        seen2.add(ck)
+        out2.append(r)
+    return out2[:k], dist
+
+
+def _load_jsonl(path: Path) -> list_cmd[dict[str, Any]]:
+    out: list_cmd[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for ln, line in enumerate(f, start=1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            try:
+                out.append(json.loads(s))
+            except Exception as e:
+                raise ValueError(f"Bad JSONL at {path}:{ln}: {e}\nLine: {s[:200]}") from e
+    return out
+
+
+
 @app.command()
 def index(
     pdf_dir: Path = typer.Option(
@@ -120,15 +317,6 @@ def index(
 
     Records file-level metadata (path, mtime, size) in the `sources` table.
     Does not extract page text. Use `paperbrace extract` for extraction.
-
-    Args:
-        pdf_dir: Folder containing PDFs.
-        db_path: SQLite DB file path.
-        commit_every: Commit after every N PDFs processed.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
     """
     setup_logging(verbose)
     conn = connect(db_path)
@@ -141,23 +329,13 @@ def index(
     logger.info("Indexed %d PDFs → %s", n, db_path)
 
 
-@app.command()
-def list(
+@app.command("list")
+def list_cmd(
     limit: int = typer.Option(20, "--limit", "-n", min=1, max=200, help="Max rows to display."),
     db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """
-    List known sources (id + extraction status + path).
-
-    Args:
-        limit: Maximum number of sources to display.
-        db_path: SQLite DB file path.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
-    """
+    """List known sources (id + extraction status + path)."""
     setup_logging(verbose)
     conn = connect(db_path)
     init_db(conn)
@@ -184,22 +362,7 @@ def extract(
     commit_every: int = typer.Option(5, "--commit-every", min=1, max=200, help="Commit frequency during --all."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """
-    Extract per-page text for one paper or all sources.
-
-    Stores page text in `pages` and updates `pages_fts` for keyword search.
-
-    Args:
-        source_id: Extract a single paper by id (mutually exclusive with --all).
-        all_: Extract all sources (mutually exclusive with --paper-id).
-        db_path: SQLite DB file path.
-        force: Re-extract even if PDF mtime is unchanged.
-        commit_every: Commit frequency in batch mode.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
-    """
+    """Extract per-page text for one paper or all sources."""
     setup_logging(verbose)
     conn = connect(db_path)
     init_db(conn)
@@ -224,18 +387,7 @@ def purge(
     vacuum: bool = typer.Option(False, "--vacuum", help="Reclaim space after purge (slower)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """
-    Delete ALL rows from the SQLite DB (sources/pages/pages_fts).
-
-    Args:
-        db_path: SQLite DB file path.
-        yes: Must be set to confirm.
-        vacuum: If True, VACUUM after purge.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
-    """
+    """Delete ALL rows from the SQLite DB (sources/pages/pages_fts)."""
     setup_logging(verbose)
     if not yes:
         raise typer.BadParameter("Refusing to purge without --yes")
@@ -253,18 +405,7 @@ def search(
     db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """
-    Keyword search over extracted text using SQLite FTS5.
-
-    Args:
-        query: FTS query string.
-        limit: Max results to show.
-        db_path: SQLite DB file path.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
-    """
+    """Keyword search over extracted text using SQLite FTS5."""
     setup_logging(verbose)
     conn = connect(db_path)
     init_db(conn)
@@ -276,7 +417,7 @@ def search(
     table.add_column("file")
     table.add_column("snippet")
 
-    for source_id, page_num, path, snip, distance in rows:
+    for source_id, page_num, path, snip, _distance in rows:
         fname = _cap_filename(Path(path).name, 30)
         table.add_row(str(source_id), str(page_num), fname, snip)
 
@@ -304,30 +445,16 @@ def embed(
         "--distance",
         help="Embedding-time distance metric for the vector index: cosine | l2 | ip",
     ),
+    offline: bool = typer.Option(
+        False,
+        "--offline/--no-offline",
+        help="Force HF/Transformers offline mode (no network). Requires models already cached.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
-    """
-    Build/update the semantic vector index from extracted pages.
-
-    Requires that PDFs are already extracted into `pages` (run `paperbrace extract` first).
-
-    Args:
-        source_id: Single paper id to embed (0 means use --all).
-        all_: Embed all extracted sources.
-        db_path: SQLite DB file path (sources/pages).
-        backend: Vector backend: chroma or flat.
-        force: Re-embed even if unchanged.
-        commit_every: Commit frequency for embed bookkeeping.
-        chroma_db_path: Where Chroma persists its index.
-        flat_index_dir: Where the flat index persists (embeddings + metadata).
-        collection: Collection/index name for the backend.
-        embedding_model: Embedding model id for SentenceTransformers.
-        verbose: Enable debug logging.
-
-    Returns:
-        None
-    """
+    """Build/update the semantic vector index from extracted pages."""
     setup_logging(verbose)
+    _set_hf_offline(offline)
     conn = connect(db_path)
     init_db(conn)
 
@@ -370,8 +497,152 @@ def embed(
         collection_name=collection,
         embedding_model=embedding_model,
     )
-
     conn.commit()
+
+
+@app.command("eval")
+def eval(
+    cases: Path = typer.Option(Path("eval/cases.jsonl"), "--cases", help="JSONL file of eval cases."),
+    out: Optional[Path] = typer.Option(None, "--out", help="Write JSON report to this path."),
+    show: int = typer.Option(30, "--show", help="Show first N rows in summary table."),
+    db_path: Path = typer.Option(DEFAULT_DB, "--db-path", help="SQLite database path (sources/pages)."),
+    backend: str = typer.Option("auto", "--backend", help="Default backend for semantic/hybrid: auto | chroma | flat"),
+    chroma_db_path: Path = typer.Option(DEFAULT_CHROMA_DIR, "--chroma-db-path", help="Chroma persistence directory."),
+    flat_index_dir: Path = typer.Option(DEFAULT_FLAT_DIR, "--flat-index-dir", help="Flat index directory."),
+    collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection name (backend-specific)."),
+    embedding_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--embedding-model"),
+    k: int = typer.Option(8, "--k", min=1, max=30, help="Default k (can be overridden per case)."),
+    retriever: str = typer.Option("semantic", "--retriever", help="Default mode: keyword|semantic|hybrid (override per case)."),
+    distance_cutoff: Optional[float] = typer.Option(
+        None,
+        "--distance-cutoff",
+        help="Default semantic cutoff (cosine-equivalent). Can be overridden per case.",
+    ),
+    offline: bool = typer.Option(
+        False,
+        "--offline/--no-offline",
+        help="Force HF/Transformers offline mode (no network). Requires models already cached.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
+) -> None:
+    """
+    Retrieval evaluation harness (v0): page-level hit@k and precision@k.
+
+    Case format (JSONL), minimal:
+      {"id":"vap-1","query":"...","gold_pages":[{"source_id":1,"page_num":10}]}
+
+    Optional per-case overrides:
+      mode/retriever, k, backend, distance_cutoff
+    """
+    setup_logging(verbose)
+    _set_hf_offline(offline)
+    conn = connect(db_path)
+    init_db(conn)
+
+    cases = cases.expanduser().resolve()
+    if not cases.exists():
+        raise typer.BadParameter(f"Cases file not found: {cases}")
+    logger.info("Eval cases path: %s", cases)
+    items = _load_jsonl(cases)
+
+    results: list_cmd[dict[str, Any]] = []
+    sum_hit = 0
+    sum_prec = 0.0
+    n_labeled = 0
+
+    for c in items:
+        cid = str(c.get("id", ""))
+        q = str(c.get("query") or c.get("question") or "")
+        if not q:
+            continue
+
+        mode_c = str(c.get("mode", c.get("retriever", retriever))).strip().lower()
+        k_c = int(c.get("k", k))
+        backend_c = str(c.get("backend", backend)).strip().lower()
+        cutoff_c = c.get("distance_cutoff", distance_cutoff)
+
+        gold_pages = c.get("gold_pages", [])
+        gold_set: set[tuple[int, int]] = set()
+        for g in gold_pages or []:
+            page_num = int(g["page_num"])
+            if "source_id" in g and g["source_id"] is not None:
+                source_id = int(g["source_id"])
+            else:
+                # new format: {"file_name": "...pdf", "page_num": N}
+                source_id = store.get_source_id_by_filename(conn, str(g["file_name"]))
+            gold_set.add((source_id, page_num))
+
+        rows, metric_used = _retrieve_rows(
+            conn=conn,
+            question=q,
+            mode=mode_c,
+            k=k_c,
+            backend=backend_c,
+            db_path=db_path,
+            chroma_db_path=chroma_db_path,
+            flat_index_dir=flat_index_dir,
+            collection=collection,
+            embedding_model=embedding_model,
+            distance_cutoff=cutoff_c,
+        )
+
+        got_pages = {_page_key(r) for r in rows}
+
+        hit_at_k: Optional[int] = None
+        precision_at_k: Optional[float] = None
+        if gold_set:
+            n_labeled += 1
+            hit_at_k = 1 if (got_pages & gold_set) else 0
+            precision_at_k = len(got_pages & gold_set) / max(len(got_pages), 1)
+            sum_hit += hit_at_k
+            sum_prec += precision_at_k
+
+        results.append(
+            {
+                "id": cid,
+                "query": q,
+                "mode": mode_c,
+                "k": k_c,
+                "backend": backend_c,
+                "distance_cutoff": cutoff_c,
+                "semantic_metric_used": metric_used,
+                "gold_pages": sorted(gold_set),
+                "got_pages": sorted(got_pages),
+                "hit_at_k": hit_at_k,
+                "precision_at_k": precision_at_k,
+            }
+        )
+
+    table = Table(title=f"Eval: {cases.name} (cases={len(results)}, labeled={n_labeled})")
+    table.add_column("id")
+    table.add_column("mode")
+    table.add_column("k", justify="right")
+    table.add_column("hit@k", justify="right")
+    table.add_column("prec@k", justify="right")
+    for r in results[: max(show, 0)]:
+        table.add_row(
+            r["id"],
+            r["mode"],
+            str(r["k"]),
+            "-" if r["hit_at_k"] is None else str(r["hit_at_k"]),
+            "-" if r["precision_at_k"] is None else f'{r["precision_at_k"]:.2f}',
+        )
+    console.print(table)
+
+    summary = {
+        "cases_file": str(cases),
+        "n_cases": len(results),
+        "n_labeled": n_labeled,
+        "hit_at_k_avg": (sum_hit / n_labeled) if n_labeled else None,
+        "precision_at_k_avg": (sum_prec / n_labeled) if n_labeled else None,
+        "results": results,
+    }
+
+    if out:
+        out = out.expanduser().resolve()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        logger.info("Wrote → %s", out)
 
 
 @app.command()
@@ -393,55 +664,38 @@ def ask(
         help="Vector backend for semantic/hybrid: auto | chroma | flat",
     ),
     chroma_db_path: Path = typer.Option(DEFAULT_CHROMA_DIR, "--chroma-db-path", help="Chroma persistence directory."),
-    flat_index_dir: Path = typer.Option(Path(".paperbrace/flat"), "--flat-index-dir", help="Flat index directory."),
+    flat_index_dir: Path = typer.Option(DEFAULT_FLAT_DIR, "--flat-index-dir", help="Flat index directory."),
     collection: str = typer.Option("paperbrace_pages", "--collection", help="Collection name (backend-specific)."),
     embedding_model: str = typer.Option("sentence-transformers/all-MiniLM-L6-v2", "--embedding-model"),
     distance_cutoff: Optional[float] = typer.Option(
         None,
         "--distance-cutoff",
-        help="Discard semantic hits with cosine-equivalent distance > this value (lower is better)." \
-        "Default: None (no cuttoff); balanced: 0.60; Strict (high precision): 0.45–0.50; Loose (high recall): 0.70–0.80",
+        help=(
+            "Discard semantic hits with cosine-equivalent distance > this value (lower is better). "
+            "Default: None (no cutoff). Balanced: 0.60; Strict: 0.45–0.50; Loose: 0.70–0.80."
+        ),
     ),
-    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
-        debug: bool = typer.Option(
+    debug: bool = typer.Option(
         False,
         "--debug/--no-debug",
         help="Show extra debugging details (e.g., raw bm25, raw semantic distances, backend/metric info).",
     ),
+    offline: bool = typer.Option(
+        False,
+        "--offline/--no-offline",
+        help="Force HF/Transformers offline mode (no network). Requires models already cached.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable debug logging."),
 ) -> None:
     """
     Answer a question using retrieved evidence + a local Hugging Face LLM.
 
     For pure keyword lookup without an LLM, use `paperbrace search`.
-
-    Retrieval modes:
-      - keyword: SQLite FTS5 over extracted pages (pages_fts), ranked by bm25().
-      - semantic: vector search over embedded pages (requires `paperbrace embed`).
-      - hybrid: semantic results first, then keyword fill; de-duped by (source_id, page_num).
-
-    Vector backends (for semantic/hybrid):
-      - chroma: persistent Chroma DB (requires `paperbrace[chroma]`)
-      - flat: local NumPy index (requires `paperbrace[flat]`)
-      - auto: prefer chroma if installed, else flat if installed
     """
     setup_logging(verbose)
+    _set_hf_offline(offline)
     conn = connect(db_path)
     init_db(conn)
-
-    b = (backend or "").strip().lower()
-    if b not in {"auto", "chroma", "flat"}:
-        raise typer.BadParameter("Invalid --backend. Use: auto | chroma | flat")
-
-    # If user asked auto, make_retriever will pick the backend,
-    # but we still need to know which "embedded mapping" to use.
-    # Strategy: when auto is selected, try chroma mapping first, then flat mapping.
-    def _backend_info(preferred_backend: str) -> tuple[str, str, str]:
-        info = store.get_vector_index(conn, backend=preferred_backend, collection_name=collection)
-        if info:
-            col, dist, *_ = info
-            return preferred_backend, col, dist
-        # fallback: assume cosine on base collection if never embedded
-        return preferred_backend, collection, "cosine"
 
     # Resolve model (LLM-only)
     cfg_file = load_config(config)
@@ -457,128 +711,23 @@ def ask(
     if mode not in {"keyword", "semantic", "hybrid"}:
         raise typer.BadParameter("Invalid --retriever. Use: keyword | semantic | hybrid")
 
-    # Row shape used by ask(): (source_id, page_num, chunk_id, char_start, chat_end, fingerprint, path, text, distance, retrieval)
-    Row: TypeAlias = Tuple[int, int, Optional[int], Optional[int], Optional[int], Optional[str], str, str, float, str]
-    
-    def _chunk_key(r: Row) -> tuple[int, int, Optional[int]]:
-        sid, pn, cid, *_ = r
-        return (sid, pn, cid)
-
-    def _page_key(r: Row) -> tuple[int, int]:
-        sid, pn, *_ = r
-        return (sid, pn)
-
-    if mode == "keyword":
-        kw_rows_raw = store.get_evidence_pages(conn, query=question, limit=k)
-        # attach chunk_id=None for keyword/page-level evidence
-        rows: list[Row] = [
-            (int(sid), int(pn), None, None, None, "", str(path), str(text), float(distance), "keyword",)
-            for sid, pn, path, text, distance in kw_rows_raw
-        ]
-
-    else:
-        try:
-            if b == "auto":
-                # Try chroma mapping; if none, try flat
-                if store.get_vector_index(conn, backend="chroma", collection_name=collection):
-                    chosen_backend, chosen_collection, dist = _backend_info("chroma")
-                else:
-                    chosen_backend, chosen_collection, dist = _backend_info("flat")
-            else: # It’s for when b is explicitly "chroma" or "flat"
-                chosen_backend, chosen_collection, dist = _backend_info(b)
-
-            vec = make_retriever(
-                backend=chosen_backend,
-                chroma_db_path=chroma_db_path.expanduser().resolve(),
-                flat_index_dir=flat_index_dir.expanduser().resolve(),
-                collection=chosen_collection,           # <-- uses embedded metric collection
-                embedding_model=embedding_model,     # you can also choose to enforce the stored one
-                db_path=db_path,
-                distance=dist,                       # <-- pass for flat validation / chroma creation
-            )    
-        except Exception as e:
-            logger.error("%s", e)
-            raise typer.Exit(code=2)
-
-        sem_hits = vec.query(question, k=k, where=None)
-
-        if distance_cutoff is not None:
-            sem_hits = [
-                h for h in sem_hits
-                if _cosine_equiv_distance(float(h.distance), dist) <= distance_cutoff
-            ]
-
-        # semantic rows have chunk_id (and maybe offsets)
-        sem_rows: list[Row] = [
-            (
-                int(h.source_id),
-                int(h.page_num),
-                # Following exist only in semntic retriever. Avoid crashing for keyword retriever
-                _opt_int(getattr(h, "chunk_id", None)),   
-                _opt_int(getattr(h, "char_start", None)),
-                _opt_int(getattr(h, "char_end", None)),
-                getattr(h, "fingerprint", None),
-                str(h.path),
-                str(h.text),
-                float(h.distance),
-                "semantic",
-            )
-            for h in sem_hits
-        ]
-
-        if mode == "semantic":
-            rows = sem_rows
-
-        else:
-            # Hybrid: Append keyword fill to AFTER Semantic result. Keyword search is page-level (chunk_id=None).
-            kw_rows_raw = store.get_evidence_pages(conn, query=question, limit=max(k * 2, k))
-            kw_rows: list[Row] = [
-                (int(sid), int(pn), None, None, None, "", str(path), str(text), float(distance), "keyword",)
-                for sid, pn, path, text, distance in kw_rows_raw
-            ]
-
-            merged: list[Row] = []
-            seen_chunks: set[tuple[int, int, Optional[int]]] = set()
-            pages_with_semantic: set[tuple[int, int]] = set()
-
-            # 1) semantic first: dedupe by chunk key, also remember pages covered
-            for r in sem_rows:
-                ck = _chunk_key(r)
-                if ck in seen_chunks:
-                    continue
-                seen_chunks.add(ck)
-                pages_with_semantic.add(_page_key(r))
-                merged.append(r)
-                if len(merged) >= k:
-                    break
-
-            # 2) keyword fill: only add pages not already covered by semantic
-            if len(merged) < k:
-                for r in kw_rows:
-                    pk = _page_key(r)
-                    if pk in pages_with_semantic:
-                        continue
-                    # page-level evidence uses chunk_id=None; still dedupe if repeated
-                    ck = _chunk_key(r)
-                    if ck in seen_chunks:
-                        continue
-                    seen_chunks.add(ck)
-                    merged.append(r)
-                    if len(merged) >= k:
-                        break
-
-            rows = merged
-
-    # Final dedupe (defensive): keep all semantic chunks distinct; keyword pages distinct.
-    seen_chunks: set[tuple[int, int, Optional[int]]] = set()
-    deduped: list[Row] = []
-    for r in rows:
-        ck = _chunk_key(r)
-        if ck in seen_chunks:
-            continue
-        seen_chunks.add(ck)
-        deduped.append(r)
-    rows = deduped[:k]
+    try:
+        rows, _metric = _retrieve_rows(
+            conn=conn,
+            question=question,
+            mode=mode,
+            k=k,
+            backend=backend,
+            db_path=db_path,
+            chroma_db_path=chroma_db_path,
+            flat_index_dir=flat_index_dir,
+            collection=collection,
+            embedding_model=embedding_model,
+            distance_cutoff=distance_cutoff,
+        )
+    except Exception as e:
+        logger.error("%s", e)
+        raise typer.Exit(code=2)
 
     items = [
         Evidence(
@@ -588,10 +737,10 @@ def ask(
             text=str(text),
             distance=float(dist),
             chunk_id=_opt_int(cid),
-            char_start=_opt_int(start) ,
+            char_start=_opt_int(start),
             char_end=_opt_int(end),
             fingerprint=fing,
-            retrieval=ret
+            retrieval=ret,
         )
         for sid, pn, cid, start, end, fing, path, text, dist, ret in rows
     ]
@@ -606,14 +755,15 @@ def ask(
     table.add_column("distance", justify="right")
     table.add_column("retrieval", justify="right")
     table.add_column("file")
+
     for i, e in enumerate(items, start=1):
         table.add_row(
-            f"E{i}", 
-            str(e.source_id), 
-            str(e.page_num), 
-            str(e.chunk_id + 1) if e.chunk_id is not None else _fmt_null(e.chunk_id), # make chunk_id 1 based for user
-            _fmt_null(e.char_start), 
-            _fmt_null(e.char_end), 
+            f"E{i}",
+            str(e.source_id),
+            str(e.page_num),
+            str(e.chunk_id + 1) if e.chunk_id is not None else _fmt_null(e.chunk_id),  # 1-based for user
+            _fmt_null(e.char_start),
+            _fmt_null(e.char_end),
             f"{e.distance:.4f}" if (debug or e.retrieval != "keyword") else "-",
             e.retrieval,
             _cap_filename(Path(e.path).name, 30),
@@ -635,7 +785,7 @@ def ask(
         "If evidence is insufficient, say: \"Not found in the provided sources.\""
     )
 
-    blocks: list[str] = []
+    blocks: list_cmd[str] = []
     for i, e in enumerate(items, start=1):
         label = f"E{i}"
         excerpt = (e.text or "").strip()
@@ -643,7 +793,7 @@ def ask(
             excerpt = excerpt[:1200] + "…"
         blocks.append(
             f"{label} source_id={e.source_id} page={e.page_num} file={Path(e.path).name}\n{excerpt}"
-    )
+        )
 
     user = (
         f"Question: {question}\n\n"
@@ -664,7 +814,6 @@ def ask(
     if out:
         out.write_text(to_markdown(question, items, answer=answer), encoding="utf-8")
         logger.info("Wrote → %s", out)
-
 
 
 if __name__ == "__main__":

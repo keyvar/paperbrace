@@ -30,4 +30,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [project.scripts]
-paperbrace = "paperbrace.cli:app"
+paperbrace = "paperbrace.__main__:main"
