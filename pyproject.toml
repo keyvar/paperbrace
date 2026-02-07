@@ -1,6 +1,6 @@
 [project]
 name = "paperbrace"
-version = "0.0.1"
+version = "0.1.0a0"
 requires-python = ">=3.13"
 dependencies = [
   "typer>=0.12",

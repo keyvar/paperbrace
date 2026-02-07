@@ -1,6 +1,8 @@
 # src/paperbrace/cli.py
 from __future__ import annotations
 
+from paperbrace import __version__
+
 import os
 import json
 import logging
@@ -816,5 +818,20 @@ def ask(
         logger.info("Wrote → %s", out)
 
 
-if __name__ == "__main__":
-    app()
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(__version__)
+        raise typer.Exit()
+
+@app.callback()
+def main(
+    version: Optional[bool] = typer.Option(
+        None,
+        "--version",
+        help="Show version and exit.",
+        callback=_version_callback,
+        is_eager=True,
+    )
+) -> None:
+    """Paperbrace CLI."""
+    return
