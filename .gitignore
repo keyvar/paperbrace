@@ -6,6 +6,8 @@ data/
 .DS_Store
 __pycache__/
 *.egg-info/
+dist/
+build/
 
 # Eval corpus + generated artifacts
 eval/data/
