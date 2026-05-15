@@ -15,7 +15,6 @@ from rich.table import Table
 
 from paperbrace.config import load_config
 from paperbrace.db import connect, init_db
-from paperbrace.llm_client import LLMConfig, generate as llm_generate
 from paperbrace.render import Evidence, to_markdown
 from paperbrace import store
 from paperbrace.paths import DEFAULT_DB, DEFAULT_CHROMA_DIR, DEFAULT_FLAT_DIR
@@ -696,6 +695,18 @@ def ask(
     """
     setup_logging(verbose)
     _set_hf_offline(offline)
+
+    try:
+        from paperbrace.llm_client import LLMConfig, generate as llm_generate
+    except ModuleNotFoundError as e:
+        missing = getattr(e, "name", None) or str(e)
+        logger.error(
+            "LLM dependencies not installed (missing %s). "
+            "Install with: pip install 'paperbrace[llm]'",
+            missing,
+        )
+        raise typer.Exit(code=2)
+
     conn = connect(db_path)
     init_db(conn)
 
