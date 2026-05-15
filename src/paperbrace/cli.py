@@ -707,8 +707,6 @@ def ask(
         )
         raise typer.Exit(code=2)
 
-    setup_logging(verbose)
-    _set_hf_offline(offline)
     conn = connect(db_path)
     init_db(conn)
 
